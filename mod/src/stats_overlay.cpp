@@ -56,6 +56,9 @@ static float g_statBase[kNumStats] = {0};
 // in-run pickups. yellow (perk/aug/item) = CurrentValue - snapshot = ONLY in-run gains.
 static float    g_statSnapshot[kNumStats] = {0};
 static bool     g_statSnapped[kNumStats]  = {false};   // per-stat: base snapshot captured for stat i
+static float    g_statPrev[kNumStats]     = {0};       // previous value (for change detection)
+static bool     g_statPrevInit[kNumStats] = {false};
+static uint64_t g_statFlashMs[kNumStats]  = {0};       // last-change timestamp (subtle flash)
 
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
@@ -670,6 +673,9 @@ static void PollStats() {
             // value. Their difference is the perk/augment/GE ("yellow") contribution.
             SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 8, &base);
             if (SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 12, &val)) {
+                // Flash on change: stamp the time whenever the value actually moves.
+                if (g_statPrevInit[i]) { float d = val - g_statPrev[i]; if (d > 0.0001f || d < -0.0001f) g_statFlashMs[i] = GetTickCount64(); }
+                g_statPrev[i] = val; g_statPrevInit[i] = true;
                 g_stats[i].value = val;
                 g_statBase[i] = base;
                 g_stats[i].found = true;
@@ -778,7 +784,9 @@ void Render() {
 
     const ImVec4 kYellow(1.00f, 0.85f, 0.20f, 1.0f);   // perk / augment / item (via GE)
     const ImVec4 kBlue  (0.40f, 0.70f, 1.00f, 1.0f);   // armor / gear (pending probe)
-    const ImVec4 kWhite (0.90f, 0.90f, 0.90f, 1.0f);   // total
+    const ImVec4 kGreen (0.35f, 0.92f, 0.45f, 1.0f);   // total
+    const ImVec4 kFlash (0.75f, 1.00f, 0.80f, 1.0f);   // subtle brighten on change (fades to green)
+    uint64_t nowFlash = GetTickCount64();
 
     bool anyFound = false;
     for (int i = 0; i < kNumStats; i++) {
@@ -801,7 +809,18 @@ void Render() {
         case StatDef::Modifier:   snprintf(tb, sizeof(tb), "%+.1f%%", val * 100.0f); break;
         case StatDef::Chance:     snprintf(tb, sizeof(tb), "%.1f%%", val * 100.0f); break;
         }
-        ImGui::TextColored(kWhite, "%s", tb);
+        // Green total; briefly lightened toward kFlash right after a change, easing back.
+        ImVec4 totalCol = kGreen;
+        if (g_statFlashMs[i]) {
+            uint64_t dt = nowFlash - g_statFlashMs[i];
+            if (dt < 700) {
+                float t = (float)dt / 700.0f;   // 0 = just changed .. 1 = settled
+                totalCol = ImVec4(kFlash.x + (kGreen.x - kFlash.x) * t,
+                                  kFlash.y + (kGreen.y - kFlash.y) * t,
+                                  kFlash.z + (kGreen.z - kFlash.z) * t, 1.0f);
+            }
+        }
+        ImGui::TextColored(totalCol, "%s", tb);
 
         // ── yellow contribution (Current - Base) ──
         bool showY = false; char yb[32] = {};
@@ -821,7 +840,7 @@ void Render() {
 
     // ── color legend ──
     ImGui::Separator();
-    ImGui::TextColored(kWhite, "total"); ImGui::SameLine();
+    ImGui::TextColored(kGreen, "total"); ImGui::SameLine();
     ImGui::TextColored(kBlue, "gear"); ImGui::SameLine();
     ImGui::TextColored(kYellow, "perk/aug/item");
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(gear breakdown pending)");
