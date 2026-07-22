@@ -48,10 +48,15 @@ static StatDef g_stats[] = {
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
-// BaseValue (+0x8) per stat, alongside CurrentValue (+0xC). The "yellow" contribution =
-// Current - Base = the portion applied via GameplayEffects (perks/augments/GE items).
-// Gear/weapon-affix ("blue") is a separate transient system — added after the probe.
+// BaseValue (+0x8) per stat. Kept for reference; not used for the yellow split.
 static float g_statBase[kNumStats] = {0};
+
+// "Effective base" snapshot captured at RUN START = raw base + permanent CHARACTER
+// UPGRADES (the purchased meta-progression the user wants counted as base), before any
+// in-run pickups. yellow (perk/aug/item) = CurrentValue - snapshot = ONLY in-run gains.
+static float    g_statSnapshot[kNumStats] = {0};
+static bool     g_snapshotValid = false;
+static uint64_t g_snapshotAtMs  = 0;   // hold off snapshotting until upgrades settle at run start
 
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
@@ -562,7 +567,14 @@ static void PollStats() {
     static UE::UObject* s_lastGS = nullptr;
     if (g_gameState && g_gameState != s_lastGS) {
         Log("[DMG] GameState now %p (%ls)\n", (void*)g_gameState, UEEngine::GetClassName(g_gameState).c_str());
-        if (s_lastGS) { DamageTracker::Reset(); Log("[DMG] -> new run: damage baseline reset\n"); }
+        if (s_lastGS) {
+            DamageTracker::Reset();
+            // Re-capture the effective base (raw base + character upgrades) after the run
+            // starts and upgrades settle, so the yellow delta counts only in-run pickups.
+            g_snapshotValid = false;
+            g_snapshotAtMs  = GetTickCount64() + 2500;
+            Log("[DMG] -> new run: damage + stat-base reset\n");
+        }
         s_lastGS = g_gameState;
     }
 
@@ -615,6 +627,14 @@ static void PollStats() {
                 g_stats[i].found = true;
             }
         }
+    }
+
+    // Capture the effective-base snapshot once per run (after upgrades settle): current
+    // values with no in-run pickups yet. yellow = current - snapshot = in-run gains only.
+    if (!g_snapshotValid && g_propsResolved && GetTickCount64() >= g_snapshotAtMs) {
+        for (int i = 0; i < kNumStats; i++) g_statSnapshot[i] = g_stats[i].value;
+        g_snapshotValid = true;
+        Log("[STATS] captured effective-base snapshot (base + character upgrades)\n");
     }
 }
 
@@ -673,11 +693,11 @@ void Render() {
 
     // Draw only — cached values are populated by Poll() on the mod thread.
     // ── ImGui rendering ─────────────────────────────────────────────────
-    // Positioned below the damage window (top-left). The damage window sits at (20,20)
-    // and is ~185px tall, so start the stats window just under it. Wider than before so
-    // the "total (yellow)" breakdown has room.
+    // Center-right of the screen, below the damage window (which sits just above it).
+    ImGuiIO& io = ImGui::GetIO();
+    float scrW = io.DisplaySize.x, scrH = io.DisplaySize.y;
     float windowWidth = 360.0f;
-    ImGui::SetNextWindowPos(ImVec2(20.0f, 205.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(scrW - windowWidth - 20.0f, scrH * 0.30f + 200.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.80f);
     ImGui::SetNextWindowSize(ImVec2(windowWidth, 0.0f), ImGuiCond_Always);
 
@@ -711,7 +731,8 @@ void Render() {
         anyFound = true;
 
         float val    = g_stats[i].value;
-        float yellow = val - g_statBase[i];   // perk/augment/GE contribution
+        // yellow = in-run gains only = Current - effective-base snapshot (base + upgrades).
+        float yellow = g_snapshotValid ? (val - g_statSnapshot[i]) : 0.0f;
 
         ImGui::TextUnformatted(g_stats[i].displayName);
         ImGui::SameLine(windowWidth * 0.52f);
