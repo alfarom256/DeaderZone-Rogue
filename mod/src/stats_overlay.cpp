@@ -550,16 +550,26 @@ static void PollStats() {
             g_stats[i].found = false; g_stats[i].cachedOffset = -1; g_stats[i].value = 0.0f;
         }
         g_dmgStatsComp = nullptr;   // damage component can be freed too -> re-resolve or it reads a frozen value
-        Log("[STATS] local pawn changed -> re-resolving stats (pawn=%p)\n", (void*)la.pawn);
+        // DIAGNOSTIC: log the World (map) name — a candidate run/lobby-boundary signal.
+        std::wstring worldName;
+        { UE::UObject* o = la.pawn;
+          for (int d = 0; d < 6 && o; d++) {
+              if (UEEngine::GetClassName(o).find(L"World") != std::wstring::npos) { worldName = UEEngine::GetObjectName(o); break; }
+              uint64_t nx = 0; if (!SafeReadU64((uint8_t*)o + 0x20, &nx)) break;
+              o = (UE::UObject*)(uintptr_t)nx; if (!IsValidObject(o)) break;
+          } }
+        Log("[STATS] pawn changed -> re-resolving (pawn=%p world=%ls)\n", (void*)la.pawn, worldName.c_str());
     }
 
-    // NEW RUN/STAGE: reset the run damage baseline when the run GameState instance changes
-    // (a stage spans many levels sharing one GameState; a new run loads a new one — so
-    // this resets per RUN, not per level). Re-find only when the cached one goes invalid.
+    // NEW RUN/STAGE: reset when the run GameState instance changes. Broadened match from
+    // "ValGameState" (never bound) to "GameState" + logs its class so we can see the real
+    // run-boundary structure. Re-find only when the cached one goes invalid.
     if (!g_gameState || !IsValidObject(g_gameState)) {
         g_gameState = nullptr;
         UEEngine::ForEachObject([](UE::UObject* o) -> bool {
-            if (UEEngine::GetClassName(o).find(L"ValGameState") == std::wstring::npos) return true;
+            std::wstring cn = UEEngine::GetClassName(o);
+            if (cn.find(L"GameState") == std::wstring::npos) return true;
+            if (cn.find(L"Base") != std::wstring::npos) return true;   // skip AGameStateBase CDO-ish
             if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
             g_gameState = o; return false;
         });
@@ -755,7 +765,9 @@ void Render() {
         case StatDef::Modifier:
         case StatDef::Chance:      if (yellow > 0.0005f|| yellow < -0.0005f){ snprintf(yb, sizeof(yb), "(%+.1f%%)", yellow*100.0f); showY = true; } break;
         }
-        if (showY) { ImGui::SameLine(); ImGui::TextColored(kYellow, "%s", yb); }
+        // Yellow temporarily hidden while the run-start snapshot timing is being fixed
+        // (it was mis-capturing and counting permanent character upgrades as in-run gains).
+        (void)showY; (void)yb;
     }
 
     if (!anyFound) {
@@ -768,7 +780,7 @@ void Render() {
     ImGui::TextColored(kWhite, "total"); ImGui::SameLine();
     ImGui::TextColored(kBlue, "gear"); ImGui::SameLine();
     ImGui::TextColored(kYellow, "perk/aug/item");
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(gear breakdown pending)");
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(breakdown being fixed)");
 
     ImGui::End();
 }
