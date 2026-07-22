@@ -115,7 +115,9 @@ void Render() {
         total = g_total;
     }
 
-    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_Always);
+    // Center-right of the screen (stats window sits just below this).
+    ImGuiIO& dio = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(dio.DisplaySize.x - 250.0f, dio.DisplaySize.y * 0.30f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.72f);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize
                            | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse
