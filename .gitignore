@@ -1,0 +1,23 @@
+# Build artifacts
+mod/build/
+*.obj
+*.exp
+*.ilk
+*.pdb
+
+# Runtime logs / dumps
+*.log
+*.dmp
+dzr_mod.log
+
+# Large third-party tooling (not ours to redistribute)
+tools/UE4SS_extracted/
+tools/ue4ss-src/
+tools/SanctifyEverywhere/
+tools/CustomGameConfigs_extracted/
+tools/*.zip
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vs/

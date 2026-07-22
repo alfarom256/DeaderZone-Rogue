@@ -1,0 +1,6 @@
+LIBRARY dwmapi
+EXPORTS
+    DwmFlush                    = proxy_DwmFlush
+    DwmGetCompositionTimingInfo = proxy_DwmGetCompositionTimingInfo
+    DwmIsCompositionEnabled     = proxy_DwmIsCompositionEnabled
+    DwmSetWindowAttribute       = proxy_DwmSetWindowAttribute
