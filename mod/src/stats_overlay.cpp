@@ -48,6 +48,11 @@ static StatDef g_stats[] = {
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
+// BaseValue (+0x8) per stat, alongside CurrentValue (+0xC). The "yellow" contribution =
+// Current - Base = the portion applied via GameplayEffects (perks/augments/GE items).
+// Gear/weapon-affix ("blue") is a separate transient system — added after the probe.
+static float g_statBase[kNumStats] = {0};
+
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
 static UE::UObject* g_gameState      = nullptr;   // run/stage boundary signal for damage reset
@@ -293,38 +298,6 @@ static void ReadDamageFast() {
     if (!g_dmgKey || !g_dmgStatsComp || !IsValidObject(g_dmgStatsComp)) return;
     double lifetime = 0.0;
     if (ReadRunDamageTotal(&lifetime)) DamageTracker::SetCumulative(lifetime);
-}
-
-// DIAGNOSTIC: item/augment stat affixes are NOT in the GAS attribute set — they live in
-// an aggregated modifier list on ValInventoryComponent @+0x2D00 (ptr) / +0x2D08 (count),
-// 24-byte entries {attribute-identity, magnitude, op}. Dump raw entries (multiple field
-// interpretations + try to resolve entry+0 as an FProperty name) to decode the layout so
-// we can fold active modifiers into the displayed stats.
-static void DumpEquippedModifiers(const LocalActors& la) {
-    UE::UObject* inv = nullptr;
-    UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
-        if (UEEngine::GetClassName(o).find(L"ValInventoryComponent") == std::wstring::npos) return true;
-        if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
-        if (!OwnerChainReaches(o, la)) return true;
-        inv = o; return false;
-    });
-    if (!inv) { Log("[MODS] no local ValInventoryComponent\n"); return; }
-    uint8_t* c = (uint8_t*)inv;
-    uint64_t arr = 0; int32_t num = 0;
-    SafeReadU64(c + 0x2D00, &arr); SafeReadI32(c + 0x2D08, &num);
-    Log("[MODS] inv=%p arr=%llX num=%d\n", inv, (unsigned long long)arr, num);
-    if (!IsValidPtr(arr) || num <= 0 || num > 256) return;
-    for (int i = 0; i < num && i < 48; i++) {
-        uint8_t* e = (uint8_t*)(uintptr_t)arr + (size_t)i * 24;
-        uint64_t q0 = 0, q16 = 0; int32_t i8 = 0, i12 = 0, i16 = 0, i20 = 0; float f8 = 0, f16 = 0;
-        SafeReadU64(e + 0, &q0);
-        SafeReadI32(e + 8, &i8);  SafeReadFloat(e + 8, &f8);  SafeReadI32(e + 12, &i12);
-        SafeReadU64(e + 16, &q16); SafeReadI32(e + 16, &i16); SafeReadFloat(e + 16, &f16); SafeReadI32(e + 20, &i20);
-        std::wstring nm;   // q0 as FProperty* -> FField NamePrivate @+0x28
-        if (IsValidPtr(q0)) { UE::FName fn = {}; if (SafeReadFName((uint8_t*)(uintptr_t)q0 + 0x28, &fn)) nm = UEEngine::FNameToString(fn); }
-        Log("[MODS]  [%d] q0=%llX name=%ls | +8: i=%d f=%.3f | +12: i=%d | +16: q=%llX i=%d f=%.3f | +20: i=%d\n",
-            i, (unsigned long long)q0, nm.c_str(), i8, f8, i12, (unsigned long long)q16, i16, f16, i20);
-    }
 }
 
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
@@ -595,17 +568,6 @@ static void PollStats() {
 
     PollRunDamage(la);
 
-    // DIAGNOSTIC (throttled, capped): decode the equipped item/augment modifier list so we
-    // can fold conditional bonuses into the live stats. Logs only while items are present.
-    {
-        static uint64_t s_modDump = 0; static int s_modN = 0;
-        uint64_t nowMs = GetTickCount64();
-        if (s_modN < 12 && nowMs - s_modDump > 2500 && (la.pawn || la.controller || la.state)) {
-            s_modDump = nowMs; s_modN++;
-            DumpEquippedModifiers(la);
-        }
-    }
-
     // STALENESS GUARD: even absent a detected pawn change, the cached set can be freed and
     // its memory reused. Drop it if its class pointer no longer matches what we bound.
     if (g_statsComponent && IsValidObject(g_statsComponent)) {
@@ -643,11 +605,13 @@ static void PollStats() {
 
     for (int i = 0; i < kNumStats; i++) {
         if (g_stats[i].cachedOffset >= 0) {
-            float val = 0.0f;
-            // Read the CURRENT value (+12), which reflects live modifiers/buffs; the
-            // base value at +8 doesn't change when you pick up upgrades.
+            float val = 0.0f, base = 0.0f;
+            // CURRENT (+12) reflects live GE modifiers/buffs; BASE (+8) is the unmodified
+            // value. Their difference is the perk/augment/GE ("yellow") contribution.
+            SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 8, &base);
             if (SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 12, &val)) {
                 g_stats[i].value = val;
+                g_statBase[i] = base;
                 g_stats[i].found = true;
             }
         }
@@ -736,45 +700,41 @@ void Render() {
         return;
     }
 
+    const ImVec4 kYellow(1.00f, 0.85f, 0.20f, 1.0f);   // perk / augment / item (via GE)
+    const ImVec4 kBlue  (0.40f, 0.70f, 1.00f, 1.0f);   // armor / gear (pending probe)
+    const ImVec4 kWhite (0.90f, 0.90f, 0.90f, 1.0f);   // total
+
     bool anyFound = false;
     for (int i = 0; i < kNumStats; i++) {
         if (!g_stats[i].found) continue;
         if (g_stats[i].displayName[0] == '_') continue;   // hidden (e.g. __DamageDealt)
         anyFound = true;
 
-        float val = g_stats[i].value;
+        float val    = g_stats[i].value;
+        float yellow = val - g_statBase[i];   // perk/augment/GE contribution
 
         ImGui::TextUnformatted(g_stats[i].displayName);
-        ImGui::SameLine(windowWidth * 0.6f);
+        ImGui::SameLine(windowWidth * 0.52f);
 
+        // ── total ──
+        char tb[32];
         switch (g_stats[i].format) {
-        case StatDef::Absolute:
-            ImGui::Text("%.0f", val);
-            break;
-        case StatDef::Multiplier: {
-            // Normalized: show the raw multiplier (e.g. x1.00, x2.00) so stats with
-            // different bases (Crit Damage ~2x vs Damage 1x) read consistently.
-            ImVec4 col = val > 1.005f ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f)
-                       : val < 0.995f ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
-                                      : ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
-            ImGui::TextColored(col, "x%.2f", val);
-            break;
+        case StatDef::Absolute:   snprintf(tb, sizeof(tb), "%.0f", val); break;
+        case StatDef::Multiplier: snprintf(tb, sizeof(tb), "x%.2f", val); break;
+        case StatDef::Modifier:   snprintf(tb, sizeof(tb), "%+.1f%%", val * 100.0f); break;
+        case StatDef::Chance:     snprintf(tb, sizeof(tb), "%.1f%%", val * 100.0f); break;
         }
+        ImGui::TextColored(kWhite, "%s", tb);
+
+        // ── yellow contribution (Current - Base) ──
+        bool showY = false; char yb[32] = {};
+        switch (g_stats[i].format) {
+        case StatDef::Absolute:   if (yellow >  0.5f  || yellow < -0.5f)  { snprintf(yb, sizeof(yb), "(+%.0f)", yellow);        showY = true; } break;
+        case StatDef::Multiplier: if (yellow >  0.005f|| yellow < -0.005f){ snprintf(yb, sizeof(yb), "(%+.2f)", yellow);        showY = true; } break;
         case StatDef::Modifier:
-            // Modifiers are additive from 0; show as +X%
-            if (val > -0.005f && val < 0.005f) {
-                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "--");
-            } else {
-                float pct = val * 100.0f;
-                ImVec4 col = pct > 0 ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-                ImGui::TextColored(col, "%+.1f%%", pct);
-            }
-            break;
-        case StatDef::Chance:
-            // Probability 0.0-1.0 displayed as percentage
-            ImGui::Text("%.1f%%", val * 100.0f);
-            break;
+        case StatDef::Chance:      if (yellow > 0.0005f|| yellow < -0.0005f){ snprintf(yb, sizeof(yb), "(%+.1f%%)", yellow*100.0f); showY = true; } break;
         }
+        if (showY) { ImGui::SameLine(); ImGui::TextColored(kYellow, "%s", yb); }
     }
 
     if (!anyFound) {
@@ -782,8 +742,12 @@ void Render() {
         g_propsResolved = false;
     }
 
+    // ── color legend ──
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "Live (250ms)");
+    ImGui::TextColored(kWhite, "total"); ImGui::SameLine();
+    ImGui::TextColored(kBlue, "gear"); ImGui::SameLine();
+    ImGui::TextColored(kYellow, "perk/aug/item");
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(gear breakdown pending)");
 
     ImGui::End();
 }
