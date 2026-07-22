@@ -673,11 +673,11 @@ void Render() {
 
     // Draw only — cached values are populated by Poll() on the mod thread.
     // ── ImGui rendering ─────────────────────────────────────────────────
-    ImGuiIO& io = ImGui::GetIO();
-    float screenW = io.DisplaySize.x;
-
-    float windowWidth = 280.0f;
-    ImGui::SetNextWindowPos(ImVec2(screenW - windowWidth - 20.0f, 20.0f), ImGuiCond_Always);
+    // Positioned below the damage window (top-left). The damage window sits at (20,20)
+    // and is ~185px tall, so start the stats window just under it. Wider than before so
+    // the "total (yellow)" breakdown has room.
+    float windowWidth = 360.0f;
+    ImGui::SetNextWindowPos(ImVec2(20.0f, 205.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.80f);
     ImGui::SetNextWindowSize(ImVec2(windowWidth, 0.0f), ImGuiCond_Always);
 
