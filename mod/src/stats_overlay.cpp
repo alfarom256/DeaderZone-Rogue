@@ -304,6 +304,38 @@ static void ReadDamageFast() {
     if (ReadRunDamageTotal(&lifetime)) DamageTracker::SetCumulative(lifetime);
 }
 
+// GEAR PROBE: gear/weapon stat affixes are NOT in the attribute set — they live on the
+// equipped weapons/items (per-item affix lists). Find the local ValInventoryComponent and
+// scan it for TArray candidates {ptr, count, max} to locate the equipped-items/weapons
+// array, logging each element's class so we can identify it and then follow to affixes.
+static void ProbeInventory(const LocalActors& la) {
+    UE::UObject* inv = nullptr;
+    UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
+        if (UEEngine::GetClassName(o).find(L"ValInventoryComponent") == std::wstring::npos) return true;
+        if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
+        if (!OwnerChainReaches(o, la)) return true;
+        inv = o; return false;
+    });
+    if (!inv) { Log("[INVPROBE] no local ValInventoryComponent\n"); return; }
+    Log("[INVPROBE] inv=%p class=%ls\n", inv, UEEngine::GetClassName(inv).c_str());
+    uint8_t* c = (uint8_t*)inv;
+    for (int off = 0x28; off < 0x3200; off += 8) {
+        uint64_t ptr = 0; int32_t count = 0, maxc = 0;
+        if (!SafeReadU64(c + off, &ptr) || !IsValidPtr(ptr)) continue;
+        if (!SafeReadI32(c + off + 8, &count) || !SafeReadI32(c + off + 12, &maxc)) continue;
+        if (count < 1 || count > 40 || maxc < count || maxc > 128) continue;
+        // Interpret element 0 two ways: as a UObject* (pointer array) and as an inline
+        // struct whose first qword might be a UObject* (e.g. FValInventoryItem id ptr).
+        uint64_t q0 = 0, q0b = 0;
+        SafeReadU64((uint8_t*)(uintptr_t)ptr, &q0);              // *(ptr)  — element[0] as ptr-array
+        SafeReadU64((uint8_t*)(uintptr_t)ptr + 0x8, &q0b);      // +8 into element[0]
+        std::wstring clsPtr, clsInline;
+        if (IsValidObject((UE::UObject*)(uintptr_t)q0))  clsPtr    = UEEngine::GetClassName((UE::UObject*)(uintptr_t)q0);
+        Log("[INVPROBE] +0x%X: cnt=%d max=%d e0=%llX (%ls) e0+8=%llX\n",
+            off, count, maxc, (unsigned long long)q0, clsPtr.c_str(), (unsigned long long)q0b);
+    }
+}
+
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
 // The stats read frozen at 1.0 because we bind the FIRST matching attribute set,
 // but in a level every character (player + enemies) plus templates own one. This
@@ -584,6 +616,17 @@ static void PollStats() {
     }
 
     PollRunDamage(la);
+
+    // GEAR PROBE (throttled, capped): locate the equipped-items array so we can fold weapon
+    // affixes ("blue") into the stats. Logs a handful of times then stops.
+    {
+        static uint64_t s_ip = 0; static int s_ipN = 0;
+        uint64_t nowMs = GetTickCount64();
+        if (s_ipN < 10 && nowMs - s_ip > 2500 && (la.pawn || la.controller || la.state)) {
+            s_ip = nowMs; s_ipN++;
+            ProbeInventory(la);
+        }
+    }
 
     // STALENESS GUARD: even absent a detected pawn change, the cached set can be freed and
     // its memory reused. Drop it if its class pointer no longer matches what we bound.
