@@ -55,7 +55,7 @@ static float g_statBase[kNumStats] = {0};
 // UPGRADES (the purchased meta-progression the user wants counted as base), before any
 // in-run pickups. yellow (perk/aug/item) = CurrentValue - snapshot = ONLY in-run gains.
 static float    g_statSnapshot[kNumStats] = {0};
-static bool     g_snapshotValid = false;
+static bool     g_statSnapped[kNumStats]  = {false};   // per-stat: base snapshot captured for stat i
 
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
@@ -634,18 +634,19 @@ static void PollStats() {
         }
     }
 
-    // Capture the base snapshot ONCE, the first time the values are actually populated
-    // (not a just-bound 0'd set — that was the bug). This is base + permanent character
-    // upgrades with no in-run pickups. In-run GE buffs clear at run end, so Current returns
-    // to this between runs; yellow = Current - snapshot = in-run gains only, every run.
-    if (!g_snapshotValid && g_propsResolved) {
-        bool valid = false;
+    // Capture each stat's base snapshot the FIRST time IT is found on a LIVE component
+    // (gated by a Multiplier reading real, so we never snapshot a 0'd/just-bound set).
+    // Per-stat, not all-at-once: a stat that resolves a beat later still snapshots its OWN
+    // value instead of the 0 it had while unresolved (that was the Max Health +300 bug).
+    // This snapshot = base + permanent character upgrades; in-run GE buffs clear at run end
+    // so Current returns here between runs -> yellow = Current - snapshot = in-run only.
+    {
+        bool dataLive = false;
         for (int i = 0; i < kNumStats; i++)
-            if (g_stats[i].found && g_stats[i].format == StatDef::Multiplier && g_stats[i].value >= 0.9f) { valid = true; break; }
-        if (valid) {
-            for (int i = 0; i < kNumStats; i++) g_statSnapshot[i] = g_stats[i].value;
-            g_snapshotValid = true;
-            Log("[STATS] captured base snapshot (base + character upgrades)\n");
+            if (g_stats[i].found && g_stats[i].format == StatDef::Multiplier && g_stats[i].value >= 0.9f) { dataLive = true; break; }
+        if (dataLive) {
+            for (int i = 0; i < kNumStats; i++)
+                if (!g_statSnapped[i] && g_stats[i].found) { g_statSnapshot[i] = g_stats[i].value; g_statSnapped[i] = true; }
         }
     }
 }
@@ -743,8 +744,8 @@ void Render() {
         anyFound = true;
 
         float val    = g_stats[i].value;
-        // yellow = in-run gains only = Current - effective-base snapshot (base + upgrades).
-        float yellow = g_snapshotValid ? (val - g_statSnapshot[i]) : 0.0f;
+        // yellow = in-run gains only = Current - base snapshot (base + character upgrades).
+        float yellow = g_statSnapped[i] ? (val - g_statSnapshot[i]) : 0.0f;
 
         ImGui::TextUnformatted(g_stats[i].displayName);
         ImGui::SameLine(windowWidth * 0.52f);
