@@ -56,7 +56,6 @@ static float g_statBase[kNumStats] = {0};
 // in-run pickups. yellow (perk/aug/item) = CurrentValue - snapshot = ONLY in-run gains.
 static float    g_statSnapshot[kNumStats] = {0};
 static bool     g_snapshotValid = false;
-static uint64_t g_snapshotAtMs  = 0;   // hold off snapshotting until upgrades settle at run start
 
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
@@ -578,12 +577,8 @@ static void PollStats() {
     if (g_gameState && g_gameState != s_lastGS) {
         Log("[DMG] GameState now %p (%ls)\n", (void*)g_gameState, UEEngine::GetClassName(g_gameState).c_str());
         if (s_lastGS) {
-            DamageTracker::Reset();
-            // Re-capture the effective base (raw base + character upgrades) after the run
-            // starts and upgrades settle, so the yellow delta counts only in-run pickups.
-            g_snapshotValid = false;
-            g_snapshotAtMs  = GetTickCount64() + 2500;
-            Log("[DMG] -> new run: damage + stat-base reset\n");
+            DamageTracker::Reset();   // per-run damage reset (base snapshot is captured once and stays)
+            Log("[DMG] -> new run: damage baseline reset\n");
         }
         s_lastGS = g_gameState;
     }
@@ -639,12 +634,19 @@ static void PollStats() {
         }
     }
 
-    // Capture the effective-base snapshot once per run (after upgrades settle): current
-    // values with no in-run pickups yet. yellow = current - snapshot = in-run gains only.
-    if (!g_snapshotValid && g_propsResolved && GetTickCount64() >= g_snapshotAtMs) {
-        for (int i = 0; i < kNumStats; i++) g_statSnapshot[i] = g_stats[i].value;
-        g_snapshotValid = true;
-        Log("[STATS] captured effective-base snapshot (base + character upgrades)\n");
+    // Capture the base snapshot ONCE, the first time the values are actually populated
+    // (not a just-bound 0'd set — that was the bug). This is base + permanent character
+    // upgrades with no in-run pickups. In-run GE buffs clear at run end, so Current returns
+    // to this between runs; yellow = Current - snapshot = in-run gains only, every run.
+    if (!g_snapshotValid && g_propsResolved) {
+        bool valid = false;
+        for (int i = 0; i < kNumStats; i++)
+            if (g_stats[i].found && g_stats[i].format == StatDef::Multiplier && g_stats[i].value >= 0.9f) { valid = true; break; }
+        if (valid) {
+            for (int i = 0; i < kNumStats; i++) g_statSnapshot[i] = g_stats[i].value;
+            g_snapshotValid = true;
+            Log("[STATS] captured base snapshot (base + character upgrades)\n");
+        }
     }
 }
 
@@ -765,9 +767,7 @@ void Render() {
         case StatDef::Modifier:
         case StatDef::Chance:      if (yellow > 0.0005f|| yellow < -0.0005f){ snprintf(yb, sizeof(yb), "(%+.1f%%)", yellow*100.0f); showY = true; } break;
         }
-        // Yellow temporarily hidden while the run-start snapshot timing is being fixed
-        // (it was mis-capturing and counting permanent character upgrades as in-run gains).
-        (void)showY; (void)yb;
+        if (showY) { ImGui::SameLine(); ImGui::TextColored(kYellow, "%s", yb); }
     }
 
     if (!anyFound) {
@@ -780,7 +780,7 @@ void Render() {
     ImGui::TextColored(kWhite, "total"); ImGui::SameLine();
     ImGui::TextColored(kBlue, "gear"); ImGui::SameLine();
     ImGui::TextColored(kYellow, "perk/aug/item");
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(breakdown being fixed)");
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(gear breakdown pending)");
 
     ImGui::End();
 }
