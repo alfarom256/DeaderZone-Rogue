@@ -438,6 +438,7 @@ static void RenderHud(IDXGISwapChain* sc) {
         return;
     }
     if (g_menuOpen) return;
+    if (!g_hudVisible) return;   // F8-toggled off: leave the game frame untouched
 
     IDXGISwapChain3* sc3 = nullptr;
     if (FAILED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3)) || !sc3) return;
@@ -652,7 +653,7 @@ void Init(HWND gameWindow) {
     HookGamePresent();
 
     g_running = true;
-    Log("[OVERLAY] Fully initialized, F10 to toggle menu\n");
+    Log("[OVERLAY] Fully initialized, F8 to toggle HUD\n");
 }
 
 void RenderLoop() {
@@ -664,6 +665,18 @@ void RenderLoop() {
         }
 
         if (!IsWindow(g_gameWindow)) break;
+
+        // F8 toggles the HUD on/off. Edge-detected (one press = one toggle) and polled here
+        // on the mod thread, so it works regardless of game input focus.
+        {
+            static bool s_prevF8 = false;
+            bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+            if (f8 && !s_prevF8) {
+                g_hudVisible = !g_hudVisible;
+                Log("[HUD] F8 -> HUD %s\n", g_hudVisible ? "ON" : "OFF");
+            }
+            s_prevF8 = f8;
+        }
 
         // Read-only, always-on HUD: stats + damage are drawn into the GAME's own frame
         // by the Present hook (RenderHud). There is no menu anymore, so no F10 toggle and

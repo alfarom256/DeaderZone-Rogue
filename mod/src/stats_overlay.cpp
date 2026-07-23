@@ -43,14 +43,44 @@ static StatDef g_stats[] = {
     {"Move Speed",       L"MovementSpeed",                   StatDef::Multiplier, -1, 0, false},
     {"Sprint Speed",     L"SprintSpeedMultiplier",           StatDef::Multiplier, -1, 0, false},
     {"Headshot Dmg",     L"HeadshotDamageModifier",          StatDef::Modifier,   -1, 0, false},
-    // Hidden — drives the damage tracker from the game's cumulative counter.
+    // Hidden proc-chance variants (single '_' = diagnostic, logged but not drawn). "Proc
+    // Chance" above reads only UniversalProcChanceMultiplier; a +9% proc-gear roll may land on
+    // one of these instead, so we log them all to see which one moves.
+    {"_ProcWeaponStat",  L"WeaponProcChanceMultiplierStat",    StatDef::Multiplier, -1, 0, false},
+    {"_ProcPrimary",     L"PrimaryWeaponProcChanceMultiplier", StatDef::Multiplier, -1, 0, false},
+    {"_ProcSecondary",   L"SecondaryWeaponProcChanceMultiplier",StatDef::Multiplier,-1, 0, false},
+    {"_ProcMelee",       L"MeleeProcChanceMultiplier",         StatDef::Multiplier, -1, 0, false},
+    {"_ProcElement",     L"ElementProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
+    // Hidden ('__') — drives the damage tracker from the game's cumulative counter.
     {"__DamageDealt",    L"DamageDealt",                     StatDef::Absolute,   -1, 0, false},
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
+// Raw BaseValue (+0x8, FGameplayAttributeData) per stat. NOTE: permanent character upgrades
+// live in CurrentValue, NOT here (confirmed in-game: Max Health base=100, cur=300 with the
+// health perk maxed). So raw Base does NOT include upgrades and is only kept for reference.
+static float g_statBase[kNumStats] = {0};
+
+// "Effective base" = CurrentValue captured while in the LOBBY (raw + character upgrades, no
+// run pickups). yellow (in-run gear/items) = CurrentValue - effective base. Tracked live in
+// the lobby so it absorbs every perk purchase; frozen during a run so pickups show as yellow.
+static float g_statBaseVal[kNumStats] = {0};
+static bool  g_statBaseSet[kNumStats] = {false};
+
+static float    g_statPrev[kNumStats]     = {0};       // previous value (for change detection)
+static bool     g_statPrevInit[kNumStats] = {false};
+static uint64_t g_statFlashMs[kNumStats]  = {0};       // last-change timestamp (subtle flash)
+
+// One-shot (re-armed on pawn change): dump Base vs Current for every stat so the yellow
+// split is confirmed from data, not assumed.
+static bool     g_statbcDump = true;
+
+// Lobby vs active run, from the authoritative GameState class (lobby hub uses a distinct
+// GameState — BP_MainMenuGameState_C — from an in-run GameState).
+static bool     g_inLobby = true;
+
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
-static UE::UObject* g_gameState      = nullptr;   // run/stage boundary signal for damage reset
 static bool         g_initialized    = false;
 static bool         g_scanComplete   = false;
 static bool         g_propsResolved  = false;
@@ -151,7 +181,7 @@ static bool ClassHasProp(UE::UObject* obj, const wchar_t* want) {
 // machine's own player on both client and listen-server host), so this is "me",
 // never a teammate. We match the attribute set whose owner chain reaches any of
 // these — the ASC may hang off the PlayerState rather than the pawn.
-struct LocalActors { UE::UObject* pawn; UE::UObject* controller; UE::UObject* state; };
+struct LocalActors { UE::UObject* pawn; UE::UObject* controller; UE::UObject* state; UE::UObject* gameState; };
 
 static UE::UObject* FindObjByExactName(const wchar_t* name) {
     UE::UObject* r = nullptr;
@@ -188,6 +218,20 @@ static UE::UObject* CallGetLocalActor(UE::UObject* gsCDO, UE::UObject* worldCtx,
     return (UE::UObject*)p.ret;
 }
 
+// UGameplayStatics::GetGameState(WorldContext) — 1-arg static (ReturnValue@0x8, NOT the
+// 2-arg GetPlayerX layout). Authoritative current-world GameState; used as the lobby/run
+// signal (its class distinguishes the hub from an active run).
+static UE::UObject* CallGetGameState(UE::UObject* gsCDO, UE::UObject* worldCtx) {
+    if (!gsCDO || !worldCtx || !UEEngine::HasProcessEvent()) return nullptr;
+    void* cls = nullptr;
+    if (!SafeReadU64(&gsCDO->ClassPrivate, (uint64_t*)&cls) || !cls) return nullptr;
+    UE::UObject* fn = UEEngine::FindFunction((UE::UObject*)cls, L"GetGameState");
+    if (!fn) return nullptr;
+    struct { void* wco; void* ret; } p = { worldCtx, nullptr };
+    UEEngine::ProcessEvent(gsCDO, fn, &p);
+    return (UE::UObject*)p.ret;
+}
+
 static LocalActors ResolveLocalActors() {
     LocalActors la = {};
     UE::UObject* gsCDO = FindObjByExactName(L"Default__GameplayStatics");
@@ -196,6 +240,7 @@ static LocalActors ResolveLocalActors() {
     la.pawn       = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerPawn");
     la.controller = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerController");
     la.state      = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerState");
+    la.gameState  = CallGetGameState(gsCDO, worldCtx);
     return la;
 }
 
@@ -295,36 +340,43 @@ static void ReadDamageFast() {
     if (ReadRunDamageTotal(&lifetime)) DamageTracker::SetCumulative(lifetime);
 }
 
-// DIAGNOSTIC: item/augment stat affixes are NOT in the GAS attribute set — they live in
-// an aggregated modifier list on ValInventoryComponent @+0x2D00 (ptr) / +0x2D08 (count),
-// 24-byte entries {attribute-identity, magnitude, op}. Dump raw entries (multiple field
-// interpretations + try to resolve entry+0 as an FProperty name) to decode the layout so
-// we can fold active modifiers into the displayed stats.
-static void DumpEquippedModifiers(const LocalActors& la) {
-    UE::UObject* inv = nullptr;
+// GEAR PROBE: gear stat affixes are NOT in the attribute set — they live on the equipped
+// items. Locate them by scanning every LOCAL-owned inventory/armor/item/weapon object for the
+// user's KNOWN affix magnitudes (green chest +6 Max Health, green boots +2 Max Shield). Each
+// 6.0/2.0 hit is logged with adjacent-qword context so we can identify the affix struct
+// (target FProperty + magnitude) and fold gear into "blue".
+static bool NearF(float v, float t) { float d = v - t; return d < 0.02f && d > -0.02f; }
+
+static void ProbeInventory(const LocalActors& la) {
+    int scanned = 0;
     UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
-        if (UEEngine::GetClassName(o).find(L"ValInventoryComponent") == std::wstring::npos) return true;
+        std::wstring cn = UEEngine::GetClassName(o);
+        bool gear = cn.find(L"Inventory") != std::wstring::npos || cn.find(L"Armor")  != std::wstring::npos
+                 || cn.find(L"Equipment") != std::wstring::npos || cn.find(L"Loadout")!= std::wstring::npos
+                 || cn.find(L"Item")      != std::wstring::npos || cn.find(L"Weapon") != std::wstring::npos
+                 || cn.find(L"Gear")      != std::wstring::npos;
+        if (!gear) return true;
         if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
         if (!OwnerChainReaches(o, la)) return true;
-        inv = o; return false;
+        uint8_t* c = (uint8_t*)o;
+        scanned++;
+        for (int off = 0x28; off < 0x1800; off += 4) {
+            float f = 0.0f;
+            if (!SafeReadFloat(c + off, &f)) continue;
+            if (NearF(f, 6.0f) || NearF(f, 2.0f)) {
+                int a = off & ~7;
+                uint64_t qm = 0, qp = 0;
+                SafeReadU64(c + a - 8, &qm);   // qword before the aligned slot
+                SafeReadU64(c + a + 8, &qp);   // qword after
+                std::wstring pc;
+                if (IsValidObject((UE::UObject*)(uintptr_t)qm)) pc = UEEngine::GetClassName((UE::UObject*)(uintptr_t)qm);
+                Log("[GEARSCAN] %ls +0x%X=%.2f  pre=%llX(%ls) post=%llX\n",
+                    cn.c_str(), off, f, (unsigned long long)qm, pc.c_str(), (unsigned long long)qp);
+            }
+        }
+        return true;
     });
-    if (!inv) { Log("[MODS] no local ValInventoryComponent\n"); return; }
-    uint8_t* c = (uint8_t*)inv;
-    uint64_t arr = 0; int32_t num = 0;
-    SafeReadU64(c + 0x2D00, &arr); SafeReadI32(c + 0x2D08, &num);
-    Log("[MODS] inv=%p arr=%llX num=%d\n", inv, (unsigned long long)arr, num);
-    if (!IsValidPtr(arr) || num <= 0 || num > 256) return;
-    for (int i = 0; i < num && i < 48; i++) {
-        uint8_t* e = (uint8_t*)(uintptr_t)arr + (size_t)i * 24;
-        uint64_t q0 = 0, q16 = 0; int32_t i8 = 0, i12 = 0, i16 = 0, i20 = 0; float f8 = 0, f16 = 0;
-        SafeReadU64(e + 0, &q0);
-        SafeReadI32(e + 8, &i8);  SafeReadFloat(e + 8, &f8);  SafeReadI32(e + 12, &i12);
-        SafeReadU64(e + 16, &q16); SafeReadI32(e + 16, &i16); SafeReadFloat(e + 16, &f16); SafeReadI32(e + 20, &i20);
-        std::wstring nm;   // q0 as FProperty* -> FField NamePrivate @+0x28
-        if (IsValidPtr(q0)) { UE::FName fn = {}; if (SafeReadFName((uint8_t*)(uintptr_t)q0 + 0x28, &fn)) nm = UEEngine::FNameToString(fn); }
-        Log("[MODS]  [%d] q0=%llX name=%ls | +8: i=%d f=%.3f | +12: i=%d | +16: q=%llX i=%d f=%.3f | +20: i=%d\n",
-            i, (unsigned long long)q0, nm.c_str(), i8, f8, i12, (unsigned long long)q16, i16, f16, i20);
-    }
+    Log("[GEARSCAN] scanned %d local gear/item objects\n", scanned);
 }
 
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
@@ -488,6 +540,18 @@ static void ResolvePropertyOffsets() {
                         classDepth, cpOff, propName.c_str(), propOffset);
                 }
 
+                // One-shot defensive-attribute sweep: find the REAL damage-reduction / armor /
+                // dodge attributes (binary strings show ArmorDamageReduction, ArmorRating*,
+                // DamageResistanceModifiers) so we can add a correct DR stat and fix the inert ones.
+                if (verbose) {
+                    auto has = [&](const wchar_t* s){ return propName.find(s) != std::wstring::npos; };
+                    if (has(L"Armor") || has(L"Dodge") || has(L"Mitigat") || has(L"Reduc") ||
+                        has(L"Resist") || has(L"Defen") || has(L"Evas") || has(L"Block") || has(L"Tough")) {
+                        int32_t o = 0; SafeReadI32(field + 0x44, &o);
+                        Log("[ATTRLIST] %ls off=0x%X\n", propName.c_str(), o);
+                    }
+                }
+
                 for (int i = 0; i < kNumStats; i++) {
                     if (g_stats[i].cachedOffset >= 0) continue;
                     if (propName == g_stats[i].propName) {
@@ -572,37 +636,49 @@ static void PollStats() {
             g_stats[i].found = false; g_stats[i].cachedOffset = -1; g_stats[i].value = 0.0f;
         }
         g_dmgStatsComp = nullptr;   // damage component can be freed too -> re-resolve or it reads a frozen value
-        Log("[STATS] local pawn changed -> re-resolving stats (pawn=%p)\n", (void*)la.pawn);
+        g_statbcDump = true;        // re-dump Base/Current for the new map (lobby vs run)
+        // DIAGNOSTIC: log the World (map) name — a candidate run/lobby-boundary signal.
+        std::wstring worldName;
+        { UE::UObject* o = la.pawn;
+          for (int d = 0; d < 6 && o; d++) {
+              if (UEEngine::GetClassName(o).find(L"World") != std::wstring::npos) { worldName = UEEngine::GetObjectName(o); break; }
+              uint64_t nx = 0; if (!SafeReadU64((uint8_t*)o + 0x20, &nx)) break;
+              o = (UE::UObject*)(uintptr_t)nx; if (!IsValidObject(o)) break;
+          } }
+        Log("[STATS] pawn changed -> re-resolving (pawn=%p world=%ls)\n", (void*)la.pawn, worldName.c_str());
     }
 
-    // NEW RUN/STAGE: reset the run damage baseline when the run GameState instance changes
-    // (a stage spans many levels sharing one GameState; a new run loads a new one — so
-    // this resets per RUN, not per level). Re-find only when the cached one goes invalid.
-    if (!g_gameState || !IsValidObject(g_gameState)) {
-        g_gameState = nullptr;
-        UEEngine::ForEachObject([](UE::UObject* o) -> bool {
-            if (UEEngine::GetClassName(o).find(L"ValGameState") == std::wstring::npos) return true;
-            if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
-            g_gameState = o; return false;
-        });
-    }
-    static UE::UObject* s_lastGS = nullptr;
-    if (g_gameState && g_gameState != s_lastGS) {
-        Log("[DMG] GameState now %p (%ls)\n", (void*)g_gameState, UEEngine::GetClassName(g_gameState).c_str());
-        if (s_lastGS) { DamageTracker::Reset(); Log("[DMG] -> new run: damage baseline reset\n"); }
-        s_lastGS = g_gameState;
+    // LOBBY vs RUN, from the authoritative UGameplayStatics::GetGameState. The hub uses a
+    // distinct GameState (BP_MainMenuGameState_C) from an active run; this drives the yellow
+    // base capture below and the per-run damage reset. Anchored on lobby/menu tokens so it's
+    // robust to whatever the run's GameState class is named.
+    if (la.gameState && IsValidObject(la.gameState)) {
+        std::wstring gcn = UEEngine::GetClassName(la.gameState);
+        g_inLobby = gcn.find(L"MainMenu") != std::wstring::npos
+                 || gcn.find(L"Lobby")    != std::wstring::npos
+                 || gcn.find(L"FrontEnd") != std::wstring::npos;
+        static UE::UObject* s_lastGSInst = nullptr;
+        if (la.gameState != s_lastGSInst) {
+            Log("[GS] GameState %p (%ls) => %s\n", (void*)la.gameState, gcn.c_str(),
+                g_inLobby ? "LOBBY" : "RUN");
+            if (s_lastGSInst && !g_inLobby) {   // entered or reloaded a run instance
+                DamageTracker::Reset();
+                Log("[GS] run (re)start: damage reset\n");
+            }
+            s_lastGSInst = la.gameState;
+        }
     }
 
     PollRunDamage(la);
 
-    // DIAGNOSTIC (throttled, capped): decode the equipped item/augment modifier list so we
-    // can fold conditional bonuses into the live stats. Logs only while items are present.
+    // GEAR PROBE (only in a run, where gear is equipped/active; capped). Hunts the known
+    // +6/+2 affix magnitudes to locate where gear stores its stat bonuses.
     {
-        static uint64_t s_modDump = 0; static int s_modN = 0;
+        static uint64_t s_ip = 0; static int s_ipN = 0;
         uint64_t nowMs = GetTickCount64();
-        if (s_modN < 12 && nowMs - s_modDump > 2500 && (la.pawn || la.controller || la.state)) {
-            s_modDump = nowMs; s_modN++;
-            DumpEquippedModifiers(la);
+        if (!g_inLobby && s_ipN < 5 && nowMs - s_ip > 3000 && (la.pawn || la.controller || la.state)) {
+            s_ip = nowMs; s_ipN++;
+            ProbeInventory(la);
         }
     }
 
@@ -643,12 +719,50 @@ static void PollStats() {
 
     for (int i = 0; i < kNumStats; i++) {
         if (g_stats[i].cachedOffset >= 0) {
-            float val = 0.0f;
-            // Read the CURRENT value (+12), which reflects live modifiers/buffs; the
-            // base value at +8 doesn't change when you pick up upgrades.
+            float val = 0.0f, base = 0.0f;
+            // CURRENT (+12) reflects live GE modifiers/buffs; BASE (+8) is the unmodified
+            // value. Their difference is the perk/augment/GE ("yellow") contribution.
+            SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 8, &base);
             if (SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 12, &val)) {
+                // Flash on change: stamp the time whenever the value actually moves.
+                if (g_statPrevInit[i]) { float d = val - g_statPrev[i]; if (d > 0.0001f || d < -0.0001f) g_statFlashMs[i] = GetTickCount64(); }
+                g_statPrev[i] = val; g_statPrevInit[i] = true;
                 g_stats[i].value = val;
+                g_statBase[i] = base;
                 g_stats[i].found = true;
+            }
+        }
+    }
+
+    // EFFECTIVE BASE capture (drives the yellow split). Gated on the set being live (Max
+    // Health > 1, index 0) so we never freeze a transient 0/default.
+    //   LOBBY: no run pickups exist, so CurrentValue == raw+upgrades. Track it live every poll
+    //          so buying perks updates the base and yellow stays 0.
+    //   RUN:   freeze the base (carried in from the lobby). Only set-once here as a fallback if
+    //          we somehow entered a run without a lobby pass. NOT reset on pawn/level changes,
+    //          so accumulated pickups (yellow) persist across the run's levels.
+    if (g_stats[0].found && g_stats[0].value > 1.0f) {
+        for (int i = 0; i < kNumStats; i++) {
+            if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
+            if (g_inLobby)               { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
+            else if (!g_statBaseSet[i])  { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
+        }
+    }
+
+    // Diagnostic (re-armed per map): base(+8) vs cur(+12) vs effective base vs yellow.
+    if (g_statbcDump) {
+        bool anyReal = false;
+        for (int i = 0; i < kNumStats; i++) if (g_stats[i].found) { anyReal = true; break; }
+        if (anyReal && g_stats[0].value > 1.0f) {   // wait for the set to populate before dumping
+            g_statbcDump = false;
+            Log("[STATBC] inLobby=%d\n", (int)g_inLobby);
+            for (int i = 0; i < kNumStats; i++) {
+                if (!g_stats[i].found) continue;
+                if (strncmp(g_stats[i].displayName, "__", 2) == 0) continue;   // skip the damage counter only
+                Log("[STATBC] %-20s rawbase=%.3f cur=%.3f effbase=%.3f yellow=%.3f\n",
+                    g_stats[i].displayName, g_statBase[i], g_stats[i].value,
+                    g_statBaseSet[i] ? g_statBaseVal[i] : 0.0f,
+                    g_statBaseSet[i] ? g_stats[i].value - g_statBaseVal[i] : 0.0f);
             }
         }
     }
@@ -709,11 +823,11 @@ void Render() {
 
     // Draw only — cached values are populated by Poll() on the mod thread.
     // ── ImGui rendering ─────────────────────────────────────────────────
+    // Center-right of the screen, below the damage window (which sits just above it).
     ImGuiIO& io = ImGui::GetIO();
-    float screenW = io.DisplaySize.x;
-
-    float windowWidth = 280.0f;
-    ImGui::SetNextWindowPos(ImVec2(screenW - windowWidth - 20.0f, 20.0f), ImGuiCond_Always);
+    float scrW = io.DisplaySize.x, scrH = io.DisplaySize.y;
+    float windowWidth = 360.0f;
+    ImGui::SetNextWindowPos(ImVec2(scrW - windowWidth - 20.0f, scrH * 0.30f + 200.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.80f);
     ImGui::SetNextWindowSize(ImVec2(windowWidth, 0.0f), ImGuiCond_Always);
 
@@ -736,45 +850,56 @@ void Render() {
         return;
     }
 
+    const ImVec4 kYellow(1.00f, 0.85f, 0.20f, 1.0f);   // perk / augment / item (via GE)
+    const ImVec4 kBlue  (0.40f, 0.70f, 1.00f, 1.0f);   // armor / gear (pending probe)
+    const ImVec4 kGreen (0.35f, 0.92f, 0.45f, 1.0f);   // total
+    const ImVec4 kFlash (0.75f, 1.00f, 0.80f, 1.0f);   // subtle brighten on change (fades to green)
+    uint64_t nowFlash = GetTickCount64();
+
     bool anyFound = false;
     for (int i = 0; i < kNumStats; i++) {
         if (!g_stats[i].found) continue;
         if (g_stats[i].displayName[0] == '_') continue;   // hidden (e.g. __DamageDealt)
         anyFound = true;
 
-        float val = g_stats[i].value;
+        float val    = g_stats[i].value;
+        // yellow = in-run gear/item pickups = CurrentValue - effective base, where the
+        // effective base (raw + character upgrades) was captured in the lobby. 0 until captured.
+        float yellow = g_statBaseSet[i] ? (val - g_statBaseVal[i]) : 0.0f;
 
         ImGui::TextUnformatted(g_stats[i].displayName);
-        ImGui::SameLine(windowWidth * 0.6f);
+        ImGui::SameLine(windowWidth * 0.52f);
 
+        // ── total ──
+        char tb[32];
         switch (g_stats[i].format) {
-        case StatDef::Absolute:
-            ImGui::Text("%.0f", val);
-            break;
-        case StatDef::Multiplier: {
-            // Normalized: show the raw multiplier (e.g. x1.00, x2.00) so stats with
-            // different bases (Crit Damage ~2x vs Damage 1x) read consistently.
-            ImVec4 col = val > 1.005f ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f)
-                       : val < 0.995f ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
-                                      : ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
-            ImGui::TextColored(col, "x%.2f", val);
-            break;
+        case StatDef::Absolute:   snprintf(tb, sizeof(tb), "%.0f", val); break;
+        case StatDef::Multiplier: snprintf(tb, sizeof(tb), "x%.2f", val); break;
+        case StatDef::Modifier:   snprintf(tb, sizeof(tb), "%+.1f%%", val * 100.0f); break;
+        case StatDef::Chance:     snprintf(tb, sizeof(tb), "%.1f%%", val * 100.0f); break;
         }
-        case StatDef::Modifier:
-            // Modifiers are additive from 0; show as +X%
-            if (val > -0.005f && val < 0.005f) {
-                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "--");
-            } else {
-                float pct = val * 100.0f;
-                ImVec4 col = pct > 0 ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-                ImGui::TextColored(col, "%+.1f%%", pct);
+        // Green total; briefly lightened toward kFlash right after a change, easing back.
+        ImVec4 totalCol = kGreen;
+        if (g_statFlashMs[i]) {
+            uint64_t dt = nowFlash - g_statFlashMs[i];
+            if (dt < 700) {
+                float t = (float)dt / 700.0f;   // 0 = just changed .. 1 = settled
+                totalCol = ImVec4(kFlash.x + (kGreen.x - kFlash.x) * t,
+                                  kFlash.y + (kGreen.y - kFlash.y) * t,
+                                  kFlash.z + (kGreen.z - kFlash.z) * t, 1.0f);
             }
-            break;
-        case StatDef::Chance:
-            // Probability 0.0-1.0 displayed as percentage
-            ImGui::Text("%.1f%%", val * 100.0f);
-            break;
         }
+        ImGui::TextColored(totalCol, "%s", tb);
+
+        // ── yellow contribution (Current - Base) ──
+        bool showY = false; char yb[32] = {};
+        switch (g_stats[i].format) {
+        case StatDef::Absolute:   if (yellow >  0.5f  || yellow < -0.5f)  { snprintf(yb, sizeof(yb), "(+%.0f)", yellow);        showY = true; } break;
+        case StatDef::Multiplier: if (yellow >  0.005f|| yellow < -0.005f){ snprintf(yb, sizeof(yb), "(%+.2f)", yellow);        showY = true; } break;
+        case StatDef::Modifier:
+        case StatDef::Chance:      if (yellow > 0.0005f|| yellow < -0.0005f){ snprintf(yb, sizeof(yb), "(%+.1f%%)", yellow*100.0f); showY = true; } break;
+        }
+        if (showY) { ImGui::SameLine(); ImGui::TextColored(kYellow, "%s", yb); }
     }
 
     if (!anyFound) {
@@ -782,8 +907,12 @@ void Render() {
         g_propsResolved = false;
     }
 
+    // ── color legend ──
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "Live (250ms)");
+    ImGui::TextColored(kGreen, "total"); ImGui::SameLine();
+    ImGui::TextColored(kBlue, "gear"); ImGui::SameLine();
+    ImGui::TextColored(kYellow, "perk/aug/item");
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(gear breakdown pending)");
 
     ImGui::End();
 }
