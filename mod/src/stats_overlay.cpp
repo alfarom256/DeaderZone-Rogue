@@ -332,36 +332,43 @@ static void ReadDamageFast() {
     if (ReadRunDamageTotal(&lifetime)) DamageTracker::SetCumulative(lifetime);
 }
 
-// GEAR PROBE: gear/weapon stat affixes are NOT in the attribute set — they live on the
-// equipped weapons/items (per-item affix lists). Find the local ValInventoryComponent and
-// scan it for TArray candidates {ptr, count, max} to locate the equipped-items/weapons
-// array, logging each element's class so we can identify it and then follow to affixes.
+// GEAR PROBE: gear stat affixes are NOT in the attribute set — they live on the equipped
+// items. Locate them by scanning every LOCAL-owned inventory/armor/item/weapon object for the
+// user's KNOWN affix magnitudes (green chest +6 Max Health, green boots +2 Max Shield). Each
+// 6.0/2.0 hit is logged with adjacent-qword context so we can identify the affix struct
+// (target FProperty + magnitude) and fold gear into "blue".
+static bool NearF(float v, float t) { float d = v - t; return d < 0.02f && d > -0.02f; }
+
 static void ProbeInventory(const LocalActors& la) {
-    UE::UObject* inv = nullptr;
+    int scanned = 0;
     UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
-        if (UEEngine::GetClassName(o).find(L"ValInventoryComponent") == std::wstring::npos) return true;
+        std::wstring cn = UEEngine::GetClassName(o);
+        bool gear = cn.find(L"Inventory") != std::wstring::npos || cn.find(L"Armor")  != std::wstring::npos
+                 || cn.find(L"Equipment") != std::wstring::npos || cn.find(L"Loadout")!= std::wstring::npos
+                 || cn.find(L"Item")      != std::wstring::npos || cn.find(L"Weapon") != std::wstring::npos
+                 || cn.find(L"Gear")      != std::wstring::npos;
+        if (!gear) return true;
         if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
         if (!OwnerChainReaches(o, la)) return true;
-        inv = o; return false;
+        uint8_t* c = (uint8_t*)o;
+        scanned++;
+        for (int off = 0x28; off < 0x1800; off += 4) {
+            float f = 0.0f;
+            if (!SafeReadFloat(c + off, &f)) continue;
+            if (NearF(f, 6.0f) || NearF(f, 2.0f)) {
+                int a = off & ~7;
+                uint64_t qm = 0, qp = 0;
+                SafeReadU64(c + a - 8, &qm);   // qword before the aligned slot
+                SafeReadU64(c + a + 8, &qp);   // qword after
+                std::wstring pc;
+                if (IsValidObject((UE::UObject*)(uintptr_t)qm)) pc = UEEngine::GetClassName((UE::UObject*)(uintptr_t)qm);
+                Log("[GEARSCAN] %ls +0x%X=%.2f  pre=%llX(%ls) post=%llX\n",
+                    cn.c_str(), off, f, (unsigned long long)qm, pc.c_str(), (unsigned long long)qp);
+            }
+        }
+        return true;
     });
-    if (!inv) { Log("[INVPROBE] no local ValInventoryComponent\n"); return; }
-    Log("[INVPROBE] inv=%p class=%ls\n", inv, UEEngine::GetClassName(inv).c_str());
-    uint8_t* c = (uint8_t*)inv;
-    for (int off = 0x28; off < 0x3200; off += 8) {
-        uint64_t ptr = 0; int32_t count = 0, maxc = 0;
-        if (!SafeReadU64(c + off, &ptr) || !IsValidPtr(ptr)) continue;
-        if (!SafeReadI32(c + off + 8, &count) || !SafeReadI32(c + off + 12, &maxc)) continue;
-        if (count < 1 || count > 40 || maxc < count || maxc > 128) continue;
-        // Interpret element 0 two ways: as a UObject* (pointer array) and as an inline
-        // struct whose first qword might be a UObject* (e.g. FValInventoryItem id ptr).
-        uint64_t q0 = 0, q0b = 0;
-        SafeReadU64((uint8_t*)(uintptr_t)ptr, &q0);              // *(ptr)  — element[0] as ptr-array
-        SafeReadU64((uint8_t*)(uintptr_t)ptr + 0x8, &q0b);      // +8 into element[0]
-        std::wstring clsPtr, clsInline;
-        if (IsValidObject((UE::UObject*)(uintptr_t)q0))  clsPtr    = UEEngine::GetClassName((UE::UObject*)(uintptr_t)q0);
-        Log("[INVPROBE] +0x%X: cnt=%d max=%d e0=%llX (%ls) e0+8=%llX\n",
-            off, count, maxc, (unsigned long long)q0, clsPtr.c_str(), (unsigned long long)q0b);
-    }
+    Log("[GEARSCAN] scanned %d local gear/item objects\n", scanned);
 }
 
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
@@ -525,6 +532,18 @@ static void ResolvePropertyOffsets() {
                         classDepth, cpOff, propName.c_str(), propOffset);
                 }
 
+                // One-shot defensive-attribute sweep: find the REAL damage-reduction / armor /
+                // dodge attributes (binary strings show ArmorDamageReduction, ArmorRating*,
+                // DamageResistanceModifiers) so we can add a correct DR stat and fix the inert ones.
+                if (verbose) {
+                    auto has = [&](const wchar_t* s){ return propName.find(s) != std::wstring::npos; };
+                    if (has(L"Armor") || has(L"Dodge") || has(L"Mitigat") || has(L"Reduc") ||
+                        has(L"Resist") || has(L"Defen") || has(L"Evas") || has(L"Block") || has(L"Tough")) {
+                        int32_t o = 0; SafeReadI32(field + 0x44, &o);
+                        Log("[ATTRLIST] %ls off=0x%X\n", propName.c_str(), o);
+                    }
+                }
+
                 for (int i = 0; i < kNumStats; i++) {
                     if (g_stats[i].cachedOffset >= 0) continue;
                     if (propName == g_stats[i].propName) {
@@ -644,12 +663,12 @@ static void PollStats() {
 
     PollRunDamage(la);
 
-    // GEAR PROBE (throttled, capped): locate the equipped-items array so we can fold weapon
-    // affixes ("blue") into the stats. Logs a handful of times then stops.
+    // GEAR PROBE (only in a run, where gear is equipped/active; capped). Hunts the known
+    // +6/+2 affix magnitudes to locate where gear stores its stat bonuses.
     {
         static uint64_t s_ip = 0; static int s_ipN = 0;
         uint64_t nowMs = GetTickCount64();
-        if (s_ipN < 10 && nowMs - s_ip > 2500 && (la.pawn || la.controller || la.state)) {
+        if (!g_inLobby && s_ipN < 5 && nowMs - s_ip > 3000 && (la.pawn || la.controller || la.state)) {
             s_ip = nowMs; s_ipN++;
             ProbeInventory(la);
         }
