@@ -43,7 +43,15 @@ static StatDef g_stats[] = {
     {"Move Speed",       L"MovementSpeed",                   StatDef::Multiplier, -1, 0, false},
     {"Sprint Speed",     L"SprintSpeedMultiplier",           StatDef::Multiplier, -1, 0, false},
     {"Headshot Dmg",     L"HeadshotDamageModifier",          StatDef::Modifier,   -1, 0, false},
-    // Hidden — drives the damage tracker from the game's cumulative counter.
+    // Hidden proc-chance variants (single '_' = diagnostic, logged but not drawn). "Proc
+    // Chance" above reads only UniversalProcChanceMultiplier; a +9% proc-gear roll may land on
+    // one of these instead, so we log them all to see which one moves.
+    {"_ProcWeaponStat",  L"WeaponProcChanceMultiplierStat",    StatDef::Multiplier, -1, 0, false},
+    {"_ProcPrimary",     L"PrimaryWeaponProcChanceMultiplier", StatDef::Multiplier, -1, 0, false},
+    {"_ProcSecondary",   L"SecondaryWeaponProcChanceMultiplier",StatDef::Multiplier,-1, 0, false},
+    {"_ProcMelee",       L"MeleeProcChanceMultiplier",         StatDef::Multiplier, -1, 0, false},
+    {"_ProcElement",     L"ElementProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
+    // Hidden ('__') — drives the damage tracker from the game's cumulative counter.
     {"__DamageDealt",    L"DamageDealt",                     StatDef::Absolute,   -1, 0, false},
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
@@ -749,8 +757,9 @@ static void PollStats() {
             g_statbcDump = false;
             Log("[STATBC] inLobby=%d\n", (int)g_inLobby);
             for (int i = 0; i < kNumStats; i++) {
-                if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
-                Log("[STATBC] %-16s rawbase=%.3f cur=%.3f effbase=%.3f yellow=%.3f\n",
+                if (!g_stats[i].found) continue;
+                if (strncmp(g_stats[i].displayName, "__", 2) == 0) continue;   // skip the damage counter only
+                Log("[STATBC] %-20s rawbase=%.3f cur=%.3f effbase=%.3f yellow=%.3f\n",
                     g_stats[i].displayName, g_statBase[i], g_stats[i].value,
                     g_statBaseSet[i] ? g_statBaseVal[i] : 0.0f,
                     g_statBaseSet[i] ? g_stats[i].value - g_statBaseVal[i] : 0.0f);
