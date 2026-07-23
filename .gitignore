@@ -4,18 +4,18 @@ mod/build/
 *.exp
 *.ilk
 *.pdb
+*.lib
 
 # Runtime logs / dumps
 *.log
 *.dmp
-dzr_mod.log
 
-# Large third-party tooling (not ours to redistribute)
-tools/UE4SS_extracted/
-tools/ue4ss-src/
-tools/SanctifyEverywhere/
-tools/CustomGameConfigs_extracted/
-tools/*.zip
+# Not part of the published mod (source + build script only)
+docs/
+research/
+tools/
+mod/resources/
+mod/download_icons.ps1
 
 # OS / editor
 Thumbs.db
