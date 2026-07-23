@@ -48,17 +48,18 @@ static StatDef g_stats[] = {
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
-// BaseValue (+0x8) per stat. Kept for reference; not used for the yellow split.
+// BaseValue (+0x8, FGameplayAttributeData) per stat. THE base: in this roguelite the
+// permanent character upgrades bake into BaseValue, so yellow (in-run/temporary gains) =
+// CurrentValue(+0xC) - BaseValue(+0x8). No snapshot, no run-start timing to get wrong.
 static float g_statBase[kNumStats] = {0};
 
-// "Effective base" snapshot captured at RUN START = raw base + permanent CHARACTER
-// UPGRADES (the purchased meta-progression the user wants counted as base), before any
-// in-run pickups. yellow (perk/aug/item) = CurrentValue - snapshot = ONLY in-run gains.
-static float    g_statSnapshot[kNumStats] = {0};
-static bool     g_statSnapped[kNumStats]  = {false};   // per-stat: base snapshot captured for stat i
 static float    g_statPrev[kNumStats]     = {0};       // previous value (for change detection)
 static bool     g_statPrevInit[kNumStats] = {false};
 static uint64_t g_statFlashMs[kNumStats]  = {0};       // last-change timestamp (subtle flash)
+
+// One-shot (re-armed on pawn change): dump Base vs Current for every stat so the yellow
+// split is confirmed from data, not assumed.
+static bool     g_statbcDump = true;
 
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
@@ -584,6 +585,7 @@ static void PollStats() {
             g_stats[i].found = false; g_stats[i].cachedOffset = -1; g_stats[i].value = 0.0f;
         }
         g_dmgStatsComp = nullptr;   // damage component can be freed too -> re-resolve or it reads a frozen value
+        g_statbcDump = true;        // re-dump Base/Current for the new map (lobby vs run)
         // DIAGNOSTIC: log the World (map) name — a candidate run/lobby-boundary signal.
         std::wstring worldName;
         { UE::UObject* o = la.pawn;
@@ -683,19 +685,21 @@ static void PollStats() {
         }
     }
 
-    // Capture each stat's base snapshot the FIRST time IT is found on a LIVE component
-    // (gated by a Multiplier reading real, so we never snapshot a 0'd/just-bound set).
-    // Per-stat, not all-at-once: a stat that resolves a beat later still snapshots its OWN
-    // value instead of the 0 it had while unresolved (that was the Max Health +300 bug).
-    // This snapshot = base + permanent character upgrades; in-run GE buffs clear at run end
-    // so Current returns here between runs -> yellow = Current - snapshot = in-run only.
-    {
-        bool dataLive = false;
-        for (int i = 0; i < kNumStats; i++)
-            if (g_stats[i].found && g_stats[i].format == StatDef::Multiplier && g_stats[i].value >= 0.9f) { dataLive = true; break; }
-        if (dataLive) {
-            for (int i = 0; i < kNumStats; i++)
-                if (!g_statSnapped[i] && g_stats[i].found) { g_statSnapshot[i] = g_stats[i].value; g_statSnapped[i] = true; }
+    // ONE-SHOT (re-armed on pawn change): dump BaseValue(+8) vs CurrentValue(+12) for every
+    // resolved stat. Decisive evidence for the yellow split — shows whether permanent
+    // character upgrades live in BaseValue (=> Current-Base isolates in-run buffs, no yellow
+    // in the lobby) or in CurrentValue. One log burst, then quiesces until the next map.
+    if (g_statbcDump) {
+        bool anyReal = false;
+        for (int i = 0; i < kNumStats; i++) if (g_stats[i].found) { anyReal = true; break; }
+        if (anyReal) {
+            g_statbcDump = false;
+            for (int i = 0; i < kNumStats; i++) {
+                if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
+                Log("[STATBC] %-16s base=%.4f cur=%.4f  (yellow=%.4f)\n",
+                    g_stats[i].displayName, g_statBase[i], g_stats[i].value,
+                    g_stats[i].value - g_statBase[i]);
+            }
         }
     }
 }
@@ -795,8 +799,10 @@ void Render() {
         anyFound = true;
 
         float val    = g_stats[i].value;
-        // yellow = in-run gains only = Current - base snapshot (base + character upgrades).
-        float yellow = g_statSnapped[i] ? (val - g_statSnapshot[i]) : 0.0f;
+        // yellow = in-run/temporary gains = CurrentValue - BaseValue. BaseValue bakes in the
+        // permanent character upgrades, so lobby upgrades read as base (no yellow); only
+        // duration-based in-run buffs push Current above Base.
+        float yellow = val - g_statBase[i];
 
         ImGui::TextUnformatted(g_stats[i].displayName);
         ImGui::SameLine(windowWidth * 0.52f);
