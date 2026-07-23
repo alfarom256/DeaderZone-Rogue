@@ -48,10 +48,16 @@ static StatDef g_stats[] = {
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
-// BaseValue (+0x8, FGameplayAttributeData) per stat. THE base: in this roguelite the
-// permanent character upgrades bake into BaseValue, so yellow (in-run/temporary gains) =
-// CurrentValue(+0xC) - BaseValue(+0x8). No snapshot, no run-start timing to get wrong.
+// Raw BaseValue (+0x8, FGameplayAttributeData) per stat. NOTE: permanent character upgrades
+// live in CurrentValue, NOT here (confirmed in-game: Max Health base=100, cur=300 with the
+// health perk maxed). So raw Base does NOT include upgrades and is only kept for reference.
 static float g_statBase[kNumStats] = {0};
+
+// "Effective base" = CurrentValue captured while in the LOBBY (raw + character upgrades, no
+// run pickups). yellow (in-run gear/items) = CurrentValue - effective base. Tracked live in
+// the lobby so it absorbs every perk purchase; frozen during a run so pickups show as yellow.
+static float g_statBaseVal[kNumStats] = {0};
+static bool  g_statBaseSet[kNumStats] = {false};
 
 static float    g_statPrev[kNumStats]     = {0};       // previous value (for change detection)
 static bool     g_statPrevInit[kNumStats] = {false};
@@ -61,9 +67,12 @@ static uint64_t g_statFlashMs[kNumStats]  = {0};       // last-change timestamp 
 // split is confirmed from data, not assumed.
 static bool     g_statbcDump = true;
 
+// Lobby vs active run, from the authoritative GameState class (lobby hub uses a distinct
+// GameState — BP_MainMenuGameState_C — from an in-run GameState).
+static bool     g_inLobby = true;
+
 static UE::UObject* g_statsComponent = nullptr;
 static void*        g_statsClass     = nullptr;   // class ptr at bind — detects freed-and-reused memory
-static UE::UObject* g_gameState      = nullptr;   // run/stage boundary signal for damage reset
 static bool         g_initialized    = false;
 static bool         g_scanComplete   = false;
 static bool         g_propsResolved  = false;
@@ -164,7 +173,7 @@ static bool ClassHasProp(UE::UObject* obj, const wchar_t* want) {
 // machine's own player on both client and listen-server host), so this is "me",
 // never a teammate. We match the attribute set whose owner chain reaches any of
 // these — the ASC may hang off the PlayerState rather than the pawn.
-struct LocalActors { UE::UObject* pawn; UE::UObject* controller; UE::UObject* state; };
+struct LocalActors { UE::UObject* pawn; UE::UObject* controller; UE::UObject* state; UE::UObject* gameState; };
 
 static UE::UObject* FindObjByExactName(const wchar_t* name) {
     UE::UObject* r = nullptr;
@@ -201,6 +210,20 @@ static UE::UObject* CallGetLocalActor(UE::UObject* gsCDO, UE::UObject* worldCtx,
     return (UE::UObject*)p.ret;
 }
 
+// UGameplayStatics::GetGameState(WorldContext) — 1-arg static (ReturnValue@0x8, NOT the
+// 2-arg GetPlayerX layout). Authoritative current-world GameState; used as the lobby/run
+// signal (its class distinguishes the hub from an active run).
+static UE::UObject* CallGetGameState(UE::UObject* gsCDO, UE::UObject* worldCtx) {
+    if (!gsCDO || !worldCtx || !UEEngine::HasProcessEvent()) return nullptr;
+    void* cls = nullptr;
+    if (!SafeReadU64(&gsCDO->ClassPrivate, (uint64_t*)&cls) || !cls) return nullptr;
+    UE::UObject* fn = UEEngine::FindFunction((UE::UObject*)cls, L"GetGameState");
+    if (!fn) return nullptr;
+    struct { void* wco; void* ret; } p = { worldCtx, nullptr };
+    UEEngine::ProcessEvent(gsCDO, fn, &p);
+    return (UE::UObject*)p.ret;
+}
+
 static LocalActors ResolveLocalActors() {
     LocalActors la = {};
     UE::UObject* gsCDO = FindObjByExactName(L"Default__GameplayStatics");
@@ -209,6 +232,7 @@ static LocalActors ResolveLocalActors() {
     la.pawn       = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerPawn");
     la.controller = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerController");
     la.state      = CallGetLocalActor(gsCDO, worldCtx, L"GetPlayerState");
+    la.gameState  = CallGetGameState(gsCDO, worldCtx);
     return la;
 }
 
@@ -597,27 +621,25 @@ static void PollStats() {
         Log("[STATS] pawn changed -> re-resolving (pawn=%p world=%ls)\n", (void*)la.pawn, worldName.c_str());
     }
 
-    // NEW RUN/STAGE: reset when the run GameState instance changes. Broadened match from
-    // "ValGameState" (never bound) to "GameState" + logs its class so we can see the real
-    // run-boundary structure. Re-find only when the cached one goes invalid.
-    if (!g_gameState || !IsValidObject(g_gameState)) {
-        g_gameState = nullptr;
-        UEEngine::ForEachObject([](UE::UObject* o) -> bool {
-            std::wstring cn = UEEngine::GetClassName(o);
-            if (cn.find(L"GameState") == std::wstring::npos) return true;
-            if (cn.find(L"Base") != std::wstring::npos) return true;   // skip AGameStateBase CDO-ish
-            if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
-            g_gameState = o; return false;
-        });
-    }
-    static UE::UObject* s_lastGS = nullptr;
-    if (g_gameState && g_gameState != s_lastGS) {
-        Log("[DMG] GameState now %p (%ls)\n", (void*)g_gameState, UEEngine::GetClassName(g_gameState).c_str());
-        if (s_lastGS) {
-            DamageTracker::Reset();   // per-run damage reset (base snapshot is captured once and stays)
-            Log("[DMG] -> new run: damage baseline reset\n");
+    // LOBBY vs RUN, from the authoritative UGameplayStatics::GetGameState. The hub uses a
+    // distinct GameState (BP_MainMenuGameState_C) from an active run; this drives the yellow
+    // base capture below and the per-run damage reset. Anchored on lobby/menu tokens so it's
+    // robust to whatever the run's GameState class is named.
+    if (la.gameState && IsValidObject(la.gameState)) {
+        std::wstring gcn = UEEngine::GetClassName(la.gameState);
+        g_inLobby = gcn.find(L"MainMenu") != std::wstring::npos
+                 || gcn.find(L"Lobby")    != std::wstring::npos
+                 || gcn.find(L"FrontEnd") != std::wstring::npos;
+        static UE::UObject* s_lastGSInst = nullptr;
+        if (la.gameState != s_lastGSInst) {
+            Log("[GS] GameState %p (%ls) => %s\n", (void*)la.gameState, gcn.c_str(),
+                g_inLobby ? "LOBBY" : "RUN");
+            if (s_lastGSInst && !g_inLobby) {   // entered or reloaded a run instance
+                DamageTracker::Reset();
+                Log("[GS] run (re)start: damage reset\n");
+            }
+            s_lastGSInst = la.gameState;
         }
-        s_lastGS = g_gameState;
     }
 
     PollRunDamage(la);
@@ -685,20 +707,34 @@ static void PollStats() {
         }
     }
 
-    // ONE-SHOT (re-armed on pawn change): dump BaseValue(+8) vs CurrentValue(+12) for every
-    // resolved stat. Decisive evidence for the yellow split — shows whether permanent
-    // character upgrades live in BaseValue (=> Current-Base isolates in-run buffs, no yellow
-    // in the lobby) or in CurrentValue. One log burst, then quiesces until the next map.
+    // EFFECTIVE BASE capture (drives the yellow split). Gated on the set being live (Max
+    // Health > 1, index 0) so we never freeze a transient 0/default.
+    //   LOBBY: no run pickups exist, so CurrentValue == raw+upgrades. Track it live every poll
+    //          so buying perks updates the base and yellow stays 0.
+    //   RUN:   freeze the base (carried in from the lobby). Only set-once here as a fallback if
+    //          we somehow entered a run without a lobby pass. NOT reset on pawn/level changes,
+    //          so accumulated pickups (yellow) persist across the run's levels.
+    if (g_stats[0].found && g_stats[0].value > 1.0f) {
+        for (int i = 0; i < kNumStats; i++) {
+            if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
+            if (g_inLobby)               { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
+            else if (!g_statBaseSet[i])  { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
+        }
+    }
+
+    // Diagnostic (re-armed per map): base(+8) vs cur(+12) vs effective base vs yellow.
     if (g_statbcDump) {
         bool anyReal = false;
         for (int i = 0; i < kNumStats; i++) if (g_stats[i].found) { anyReal = true; break; }
-        if (anyReal) {
+        if (anyReal && g_stats[0].value > 1.0f) {   // wait for the set to populate before dumping
             g_statbcDump = false;
+            Log("[STATBC] inLobby=%d\n", (int)g_inLobby);
             for (int i = 0; i < kNumStats; i++) {
                 if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
-                Log("[STATBC] %-16s base=%.4f cur=%.4f  (yellow=%.4f)\n",
+                Log("[STATBC] %-16s rawbase=%.3f cur=%.3f effbase=%.3f yellow=%.3f\n",
                     g_stats[i].displayName, g_statBase[i], g_stats[i].value,
-                    g_stats[i].value - g_statBase[i]);
+                    g_statBaseSet[i] ? g_statBaseVal[i] : 0.0f,
+                    g_statBaseSet[i] ? g_stats[i].value - g_statBaseVal[i] : 0.0f);
             }
         }
     }
@@ -799,10 +835,9 @@ void Render() {
         anyFound = true;
 
         float val    = g_stats[i].value;
-        // yellow = in-run/temporary gains = CurrentValue - BaseValue. BaseValue bakes in the
-        // permanent character upgrades, so lobby upgrades read as base (no yellow); only
-        // duration-based in-run buffs push Current above Base.
-        float yellow = val - g_statBase[i];
+        // yellow = in-run gear/item pickups = CurrentValue - effective base, where the
+        // effective base (raw + character upgrades) was captured in the lobby. 0 until captured.
+        float yellow = g_statBaseSet[i] ? (val - g_statBaseVal[i]) : 0.0f;
 
         ImGui::TextUnformatted(g_stats[i].displayName);
         ImGui::SameLine(windowWidth * 0.52f);
