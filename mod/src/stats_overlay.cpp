@@ -349,6 +349,7 @@ static bool NearF(float v, float t) { float d = v - t; return d < 0.02f && d > -
 
 static void ProbeInventory(const LocalActors& la) {
     int scanned = 0;
+    std::wstring classes;   // every scanned object's class, to see if the real gear is reachable
     UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
         std::wstring cn = UEEngine::GetClassName(o);
         bool gear = cn.find(L"Inventory") != std::wstring::npos || cn.find(L"Armor")  != std::wstring::npos
@@ -360,14 +361,16 @@ static void ProbeInventory(const LocalActors& la) {
         if (!OwnerChainReaches(o, la)) return true;
         uint8_t* c = (uint8_t*)o;
         scanned++;
+        if (scanned <= 50) { classes += cn; classes += L" "; }
         for (int off = 0x28; off < 0x1800; off += 4) {
             float f = 0.0f;
             if (!SafeReadFloat(c + off, &f)) continue;
-            if (NearF(f, 6.0f) || NearF(f, 2.0f)) {
+            // Hunt the live gear magnitudes (health +30, shield +118) plus the earlier +6/+2.
+            if (NearF(f, 30.0f) || NearF(f, 118.0f) || NearF(f, 6.0f) || NearF(f, 2.0f)) {
                 int a = off & ~7;
                 uint64_t qm = 0, qp = 0;
-                SafeReadU64(c + a - 8, &qm);   // qword before the aligned slot
-                SafeReadU64(c + a + 8, &qp);   // qword after
+                SafeReadU64(c + a - 8, &qm);
+                SafeReadU64(c + a + 8, &qp);
                 std::wstring pc;
                 if (IsValidObject((UE::UObject*)(uintptr_t)qm)) pc = UEEngine::GetClassName((UE::UObject*)(uintptr_t)qm);
                 Log("[GEARSCAN] %ls +0x%X=%.2f  pre=%llX(%ls) post=%llX\n",
@@ -376,7 +379,7 @@ static void ProbeInventory(const LocalActors& la) {
         }
         return true;
     });
-    Log("[GEARSCAN] scanned %d local gear/item objects\n", scanned);
+    Log("[GEARSCAN] scanned %d objects: %ls\n", scanned, classes.c_str());
 }
 
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
@@ -749,7 +752,15 @@ static void PollStats() {
         }
     }
 
-    // Diagnostic (re-armed per map): base(+8) vs cur(+12) vs effective base vs yellow.
+    // Re-arm the diagnostic LIVE every 5s during a run (capped) so it captures settled
+    // post-gear values instead of only the spawn snapshot (which read pre-gear and misled us).
+    {
+        static uint64_t s_bc = 0; static int s_bcN = 0;
+        uint64_t nowb = GetTickCount64();
+        if (!g_inLobby && s_bcN < 12 && nowb - s_bc > 5000) { s_bc = nowb; s_bcN++; g_statbcDump = true; }
+    }
+
+    // Diagnostic (re-armed per map + live every 5s in a run): base(+8) vs cur(+12) vs eff base vs yellow.
     if (g_statbcDump) {
         bool anyReal = false;
         for (int i = 0; i < kNumStats; i++) if (g_stats[i].found) { anyReal = true; break; }
