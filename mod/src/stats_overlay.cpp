@@ -382,6 +382,83 @@ static void ProbeInventory(const LocalActors& la) {
     Log("[GEARSCAN] scanned %d objects: %ls\n", scanned, classes.c_str());
 }
 
+// Resolve the byte offset of a named FProperty on obj's class (walks the class hierarchy),
+// or -1. Generic version of the stats resolver, for probing other components' properties.
+static int32_t FindPropOffset(UE::UObject* obj, const wchar_t* want) {
+    void* cls = nullptr;
+    if (!SafeReadU64(&obj->ClassPrivate, (uint64_t*)&cls) || !cls) return -1;
+    uint8_t* cur = (uint8_t*)cls; int depth = 0;
+    while (cur && IsValidPtr((uint64_t)(uintptr_t)cur) && depth < 12) {
+        depth++;
+        for (int cpOff : {0x50, 0x58, 0x48, 0x60, 0x40}) {
+            uint64_t fa = 0;
+            if (!SafeReadU64(cur + cpOff, &fa) || !IsValidPtr(fa)) continue;
+            uint8_t* f = (uint8_t*)(uintptr_t)fa; int w = 0;
+            while (f && w < 800) {
+                w++;
+                UE::FName fn = {};
+                if (!SafeReadFName(f + 0x20, &fn)) break;
+                if (UEEngine::FNameToString(fn) == want) { int32_t o = 0; if (SafeReadI32(f + 0x44, &o)) return o; }
+                uint64_t nx = 0; if (!SafeReadU64(f + 0x18, &nx) || !IsValidPtr(nx)) break;
+                f = (uint8_t*)(uintptr_t)nx;
+            }
+            if (w > 2) break;
+        }
+        uint64_t sup = 0; bool fs = false;
+        for (int so : {0x40, 0x48, 0x30}) {
+            if (SafeReadU64(cur + so, &sup) && IsValidPtr(sup) && (uint8_t*)(uintptr_t)sup != cur) {
+                cur = (uint8_t*)(uintptr_t)sup; fs = true; break;
+            }
+        }
+        if (!fs) break;
+    }
+    return -1;
+}
+
+// EQUIPPED-GEAR PROBE: the loadout component tracks EquippedModifiers (gear stat mods → blue)
+// separately from EquippedAugmentIds/EquippedPerkIds (→ yellow). Find the local component that
+// has EquippedModifiers, resolve the array offsets, and dump the array bytes so we can decode
+// the modifier struct (target-attribute + magnitude) and sum gear per-stat for the blue split.
+static void ProbeEquipped(const LocalActors& la) {
+    UE::UObject* comp = nullptr;
+    UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
+        if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
+        if (!OwnerChainReaches(o, la)) return true;
+        if (!ClassHasProp(o, L"EquippedModifiers")) return true;
+        comp = o; return false;
+    });
+    if (!comp) { Log("[EQUIP] no local component with EquippedModifiers\n"); return; }
+    Log("[EQUIP] comp=%p class=%ls\n", comp, UEEngine::GetClassName(comp).c_str());
+
+    int32_t offMods = FindPropOffset(comp, L"EquippedModifiers");
+    int32_t offAug  = FindPropOffset(comp, L"EquippedAugmentIds");
+    int32_t offPerk = FindPropOffset(comp, L"EquippedPerkIds");
+    Log("[EQUIP] offsets Mods=0x%X Aug=0x%X Perk=0x%X\n", offMods, offAug, offPerk);
+    uint8_t* c = (uint8_t*)comp;
+
+    if (offMods > 0) {
+        uint64_t ptr = 0; int32_t cnt = 0, mx = 0;
+        SafeReadU64(c + offMods, &ptr); SafeReadI32(c + offMods + 8, &cnt); SafeReadI32(c + offMods + 12, &mx);
+        Log("[EQUIP] EquippedModifiers cnt=%d max=%d ptr=%llX\n", cnt, mx, (unsigned long long)ptr);
+        if (IsValidPtr(ptr) && cnt > 0 && cnt <= 64) {
+            // Dump raw bytes so we can eyeball element stride + spot magnitudes (30.0=0x41F00000,
+            // 118.0=0x42EC0000) and target-attribute FProperty pointers.
+            for (int b = 0; b < 0x200; b += 0x10) {
+                uint64_t q0 = 0, q1 = 0;
+                SafeReadU64((uint8_t*)(uintptr_t)ptr + b, &q0);
+                SafeReadU64((uint8_t*)(uintptr_t)ptr + b + 8, &q1);
+                float f0, f1, f2, f3;
+                memcpy(&f0, (char*)&q0, 4); memcpy(&f1, (char*)&q0 + 4, 4);
+                memcpy(&f2, (char*)&q1, 4); memcpy(&f3, (char*)&q1 + 4, 4);
+                Log("[EQUIP] mods+0x%02X: %016llX %016llX  f=%.2f,%.2f,%.2f,%.2f\n",
+                    b, (unsigned long long)q0, (unsigned long long)q1, f0, f1, f2, f3);
+            }
+        }
+    }
+    if (offAug  > 0) { int32_t n = 0; SafeReadI32(c + offAug  + 8, &n); Log("[EQUIP] EquippedAugmentIds cnt=%d\n", n); }
+    if (offPerk > 0) { int32_t n = 0; SafeReadI32(c + offPerk + 8, &n); Log("[EQUIP] EquippedPerkIds cnt=%d\n", n); }
+}
+
 // ── DIAGNOSTIC: enumerate every live UValAttributeSet ────────────────────────
 // The stats read frozen at 1.0 because we bind the FIRST matching attribute set,
 // but in a level every character (player + enemies) plus templates own one. This
@@ -681,6 +758,7 @@ static void PollStats() {
         uint64_t nowMs = GetTickCount64();
         if (!g_inLobby && s_ipN < 5 && nowMs - s_ip > 3000 && (la.pawn || la.controller || la.state)) {
             s_ip = nowMs; s_ipN++;
+            ProbeEquipped(la);
             ProbeInventory(la);
         }
     }
