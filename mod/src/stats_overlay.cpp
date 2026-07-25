@@ -480,12 +480,9 @@ static int32_t FindPropOffset(UE::UObject* obj, const wchar_t* want) {
 // (MovieSceneFloatTrack, Niagara*, StaticMeshComponent) and never surfaced a single gear field.
 // Reflection gives real names (e.g. the equipped-gear array) and exact offsets, which is what
 // the blue/yellow split actually needs. Same technique already used for the attribute set.
-static void DumpProps(UE::UObject* o, const wchar_t* tag) {
-    if (!o || !IsValidObject(o)) return;
-    void* cls = nullptr;
-    if (!SafeReadU64(&o->ClassPrivate, (uint64_t*)&cls) || !cls) return;
-    Log("[PROPS] === %ls obj=%p class=%p ===\n", tag, (void*)o, cls);
-    uint8_t* cur = (uint8_t*)cls;
+// Walk a UStruct/UClass's ChildProperties chain (plus SuperStruct) and log every field.
+static void DumpFieldsOf(uint8_t* structPtr, const wchar_t* tag) {
+    uint8_t* cur = structPtr;
     int depth = 0, total = 0;
     while (cur && IsValidPtr((uint64_t)(uintptr_t)cur) && depth < 12) {
         depth++;
@@ -528,6 +525,114 @@ static void DumpProps(UE::UObject* o, const wchar_t* tag) {
     Log("[PROPS] === %ls: %d props / %d classes ===\n", tag, total, depth);
 }
 
+static void DumpProps(UE::UObject* o, const wchar_t* tag) {
+    if (!o || !IsValidObject(o)) return;
+    void* cls = nullptr;
+    if (!SafeReadU64(&o->ClassPrivate, (uint64_t*)&cls) || !cls) return;
+    Log("[PROPS] === %ls obj=%p class=%p ===\n", tag, (void*)o, cls);
+    DumpFieldsOf((uint8_t*)cls, tag);
+}
+
+// Return the FProperty* for a named property on obj's class, or null.
+static uint8_t* FindPropField(UE::UObject* obj, const wchar_t* want) {
+    void* cls = nullptr;
+    if (!SafeReadU64(&obj->ClassPrivate, (uint64_t*)&cls) || !cls) return nullptr;
+    uint8_t* cur = (uint8_t*)cls; int depth = 0;
+    while (cur && IsValidPtr((uint64_t)(uintptr_t)cur) && depth < 12) {
+        depth++;
+        for (int cpOff : {0x50, 0x58, 0x48, 0x60, 0x40}) {
+            uint64_t fa = 0;
+            if (!SafeReadU64(cur + cpOff, &fa) || !IsValidPtr(fa)) continue;
+            uint8_t* f = (uint8_t*)(uintptr_t)fa; int w = 0;
+            while (f && w < 800) {
+                w++;
+                UE::FName fn = {};
+                if (!SafeReadFName(f + 0x20, &fn)) break;
+                if (UEEngine::FNameToString(fn) == want) return f;
+                uint64_t nx = 0; if (!SafeReadU64(f + 0x18, &nx) || !IsValidPtr(nx)) break;
+                f = (uint8_t*)(uintptr_t)nx;
+            }
+            if (w > 2) break;
+        }
+        uint64_t sup = 0; bool fs = false;
+        for (int so : {0x40, 0x48, 0x30}) {
+            if (SafeReadU64(cur + so, &sup) && IsValidPtr(sup) && (uint8_t*)(uintptr_t)sup != cur) {
+                cur = (uint8_t*)(uintptr_t)sup; fs = true; break;
+            }
+        }
+        if (!fs) break;
+    }
+    return nullptr;
+}
+
+static std::wstring FieldTypeName(uint8_t* f) {
+    uint64_t fc = 0;
+    if (SafeReadU64(f + 0x08, &fc) && IsValidPtr(fc)) {
+        UE::FName n = {};
+        if (SafeReadFName((uint8_t*)(uintptr_t)fc, &n)) return UEEngine::FNameToString(n);
+    }
+    return L"";
+}
+
+// Decode an ArrayProperty: log its element STRUCT layout (field names + offsets) and the raw
+// bytes of the first elements. This is what's needed to read each inventory entry's item type
+// and stat rolls, so gear (armor + weapons) can be summed into the blue contribution.
+static void DumpArrayStruct(UE::UObject* comp, const wchar_t* propName) {
+    uint8_t* f = FindPropField(comp, propName);
+    if (!f) { Log("[ARR] %ls: NOT FOUND\n", propName); return; }
+    int32_t off = 0; SafeReadI32(f + 0x44, &off);
+    int32_t h[8] = {};
+    for (int k = 0; k < 8; k++) SafeReadI32(f + 0x30 + k * 4, &h[k]);
+    Log("[ARR] %ls off=0x%X hdr=%d,%d,%d,%d,%d,%d,%d,%d\n", propName, off,
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+
+    uint64_t data = 0; int32_t cnt = 0, mx = 0;
+    SafeReadU64((uint8_t*)comp + off, &data);
+    SafeReadI32((uint8_t*)comp + off + 8, &cnt);
+    SafeReadI32((uint8_t*)comp + off + 12, &mx);
+    Log("[ARR] %ls cnt=%d max=%d data=%llX\n", propName, cnt, mx, (unsigned long long)data);
+
+    // FArrayProperty::Inner — scan plausible slots for a Property-typed field.
+    uint8_t* inner = nullptr;
+    for (int k = 0x70; k <= 0x98; k += 8) {
+        uint64_t p = 0;
+        if (!SafeReadU64(f + k, &p) || !IsValidPtr(p)) continue;
+        std::wstring tn = FieldTypeName((uint8_t*)(uintptr_t)p);
+        if (tn.find(L"Property") != std::wstring::npos) {
+            inner = (uint8_t*)(uintptr_t)p;
+            Log("[ARR] %ls inner@+0x%X type=%ls\n", propName, k, tn.c_str());
+            break;
+        }
+    }
+    if (inner) {
+        // FStructProperty::Struct — the UScriptStruct describing each element.
+        for (int k = 0x70; k <= 0x98; k += 8) {
+            uint64_t sp = 0;
+            if (!SafeReadU64(inner + k, &sp) || !IsValidPtr(sp)) continue;
+            UE::UObject* su = (UE::UObject*)(uintptr_t)sp;
+            if (!IsValidObject(su)) continue;
+            std::wstring sn = UEEngine::GetObjectName(su);
+            if (sn.empty() || sn == L"<crash>" || sn.size() > 64) continue;
+            Log("[ARR] %ls elemstruct@+0x%X = %ls\n", propName, k, sn.c_str());
+            DumpFieldsOf((uint8_t*)(uintptr_t)sp, sn.c_str());
+            break;
+        }
+    }
+    // Raw element bytes (stride not yet known — read a window and eyeball the repeat).
+    if (IsValidPtr(data) && cnt > 0) {
+        for (int b = 0; b < 0x180; b += 0x10) {
+            uint64_t q0 = 0, q1 = 0;
+            SafeReadU64((uint8_t*)(uintptr_t)data + b, &q0);
+            SafeReadU64((uint8_t*)(uintptr_t)data + b + 8, &q1);
+            float f0, f1, f2, f3;
+            memcpy(&f0, (char*)&q0, 4); memcpy(&f1, (char*)&q0 + 4, 4);
+            memcpy(&f2, (char*)&q1, 4); memcpy(&f3, (char*)&q1 + 4, 4);
+            Log("[ARR] %ls +0x%03X: %016llX %016llX f=%.2f,%.2f,%.2f,%.2f\n",
+                propName, b, (unsigned long long)q0, (unsigned long long)q1, f0, f1, f2, f3);
+        }
+    }
+}
+
 // One-shot: dump the properties of every local inventory/loadout/equipment component.
 static void ProbeLoadoutArrays(const LocalActors& la) {
     static bool s_done = false;
@@ -542,6 +647,11 @@ static void ProbeLoadoutArrays(const LocalActors& la) {
         if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
         if (!OwnerChainReaches(o, la)) return true;
         DumpProps(o, cn.c_str());
+        // Decode the inventory item struct — the source of the gear (blue) contribution.
+        if (cn.find(L"Inventory") != std::wstring::npos) {
+            DumpArrayStruct(o, L"r_Inventory");
+            DumpArrayStruct(o, L"TransientItemIds");
+        }
         n++;
         return true;
     });
