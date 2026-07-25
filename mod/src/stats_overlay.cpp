@@ -460,36 +460,78 @@ static int32_t FindPropOffset(UE::UObject* obj, const wchar_t* want) {
 // and log each with element-0 context. Run across gear swaps — whichever array's count changes
 // when you equip/unequip is the equipped-gear/modifiers list (EquippedModifiers lives nested in
 // a struct here, so a raw TArray scan finds it regardless of the struct nesting).
-static void ProbeArrays(UE::UObject* o, const wchar_t* tag) {
+// REFLECTION DUMP: walk a component's class hierarchy and log EVERY property with its name,
+// type and byte offset. This replaces a brute-force {ptr,count,max} offset scan that ran far
+// past the objects' real bounds — it produced ~300 false positives resolving to foreign classes
+// (MovieSceneFloatTrack, Niagara*, StaticMeshComponent) and never surfaced a single gear field.
+// Reflection gives real names (e.g. the equipped-gear array) and exact offsets, which is what
+// the blue/yellow split actually needs. Same technique already used for the attribute set.
+static void DumpProps(UE::UObject* o, const wchar_t* tag) {
     if (!o || !IsValidObject(o)) return;
-    uint8_t* c = (uint8_t*)o;
-    for (int off = 0x28; off < 0x4000; off += 8) {
-        uint64_t ptr = 0; int32_t cnt = 0, mx = 0;
-        if (!SafeReadU64(c + off, &ptr) || !IsValidPtr(ptr)) continue;
-        if (!SafeReadI32(c + off + 8, &cnt) || !SafeReadI32(c + off + 12, &mx)) continue;
-        if (cnt < 1 || cnt > 64 || mx < cnt || mx > 256) continue;
-        uint64_t e0 = 0, e1 = 0, e2 = 0;
-        SafeReadU64((uint8_t*)(uintptr_t)ptr, &e0);
-        SafeReadU64((uint8_t*)(uintptr_t)ptr + 8, &e1);
-        SafeReadU64((uint8_t*)(uintptr_t)ptr + 16, &e2);
-        std::wstring ec;
-        if (IsValidObject((UE::UObject*)(uintptr_t)e0)) ec = UEEngine::GetClassName((UE::UObject*)(uintptr_t)e0);
-        Log("[ARRPROBE] %ls +0x%X cnt=%d max=%d  e0=%llX(%ls) e1=%llX e2=%llX\n",
-            tag, off, cnt, mx, (unsigned long long)e0, ec.c_str(),
-            (unsigned long long)e1, (unsigned long long)e2);
+    void* cls = nullptr;
+    if (!SafeReadU64(&o->ClassPrivate, (uint64_t*)&cls) || !cls) return;
+    Log("[PROPS] === %ls obj=%p class=%p ===\n", tag, (void*)o, cls);
+    uint8_t* cur = (uint8_t*)cls;
+    int depth = 0, total = 0;
+    while (cur && IsValidPtr((uint64_t)(uintptr_t)cur) && depth < 12) {
+        depth++;
+        for (int cpOff : {0x50, 0x58, 0x48, 0x60, 0x40}) {
+            uint64_t fa = 0;
+            if (!SafeReadU64(cur + cpOff, &fa) || !IsValidPtr(fa)) continue;
+            uint8_t* f = (uint8_t*)(uintptr_t)fa; int w = 0;
+            while (f && w < 800) {
+                w++;
+                UE::FName fn = {};
+                if (!SafeReadFName(f + 0x20, &fn)) break;
+                std::wstring pn = UEEngine::FNameToString(fn);
+                if (pn.empty() || pn == L"<crash>") break;
+                // Property TYPE: FField::ClassPrivate (+0x08) -> FFieldClass::Name (+0x00).
+                // Identifies ArrayProperty/StructProperty so the gear list is unmistakable.
+                std::wstring tn;
+                uint64_t fc = 0;
+                if (SafeReadU64(f + 0x08, &fc) && IsValidPtr(fc)) {
+                    UE::FName tfn = {};
+                    if (SafeReadFName((uint8_t*)(uintptr_t)fc, &tfn)) tn = UEEngine::FNameToString(tfn);
+                }
+                int32_t off = 0, elem = 0;
+                SafeReadI32(f + 0x44, &off);   // Offset_Internal
+                SafeReadI32(f + 0x3C, &elem);  // ElementSize (stride for array elements)
+                total++;
+                Log("[PROPS] %-30ls %-18ls off=0x%X elem=%d\n", pn.c_str(), tn.c_str(), off, elem);
+                uint64_t nx = 0; if (!SafeReadU64(f + 0x18, &nx) || !IsValidPtr(nx)) break;
+                f = (uint8_t*)(uintptr_t)nx;
+            }
+            if (w > 2) break;
+        }
+        uint64_t sup = 0; bool fs = false;
+        for (int so : {0x40, 0x48, 0x30}) {
+            if (SafeReadU64(cur + so, &sup) && IsValidPtr(sup) && (uint8_t*)(uintptr_t)sup != cur) {
+                cur = (uint8_t*)(uintptr_t)sup; fs = true; break;
+            }
+        }
+        if (!fs) break;
     }
+    Log("[PROPS] === %ls: %d props / %d classes ===\n", tag, total, depth);
 }
 
+// One-shot: dump the properties of every local inventory/loadout/equipment component.
 static void ProbeLoadoutArrays(const LocalActors& la) {
+    static bool s_done = false;
+    if (s_done) return;
+    int n = 0;
     UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
         std::wstring cn = UEEngine::GetClassName(o);
-        bool want = cn == L"ValPlayerLoadoutManager" || cn == L"ValInventoryComponent";
+        bool want = cn.find(L"Inventory") != std::wstring::npos
+                 || cn.find(L"Loadout")   != std::wstring::npos
+                 || cn.find(L"Equipment") != std::wstring::npos;
         if (!want) return true;
         if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
         if (!OwnerChainReaches(o, la)) return true;
-        ProbeArrays(o, cn.c_str());
+        DumpProps(o, cn.c_str());
+        n++;
         return true;
     });
+    if (n) { s_done = true; Log("[PROPS] dumped %d local components\n", n); }
 }
 
 // EQUIPPED-GEAR PROBE: the loadout component tracks EquippedModifiers (gear stat mods → blue)
@@ -955,7 +997,9 @@ static void PollStats() {
     {
         static uint64_t s_bc = 0; static int s_bcN = 0;
         uint64_t nowb = GetTickCount64();
-        if (!g_inLobby && s_bcN < 12 && nowb - s_bc > 5000) { s_bc = nowb; s_bcN++; g_statbcDump = true; }
+        // Cap was 12 — it expired minutes into the session, so a later armor pickup was never
+        // captured (every logged sample showed yellow=0). Raised; [CHG] is the primary signal.
+        if (!g_inLobby && s_bcN < 200 && nowb - s_bc > 5000) { s_bc = nowb; s_bcN++; g_statbcDump = true; }
     }
 
     // Diagnostic (re-armed per map + live every 5s in a run): base(+8) vs cur(+12) vs eff base vs yellow.
