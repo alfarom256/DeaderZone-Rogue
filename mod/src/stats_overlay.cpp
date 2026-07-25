@@ -415,6 +415,42 @@ static int32_t FindPropOffset(UE::UObject* obj, const wchar_t* want) {
     return -1;
 }
 
+// TARGETED ARRAY PROBE: scan a known component's memory for TArray candidates {ptr,count,max}
+// and log each with element-0 context. Run across gear swaps — whichever array's count changes
+// when you equip/unequip is the equipped-gear/modifiers list (EquippedModifiers lives nested in
+// a struct here, so a raw TArray scan finds it regardless of the struct nesting).
+static void ProbeArrays(UE::UObject* o, const wchar_t* tag) {
+    if (!o || !IsValidObject(o)) return;
+    uint8_t* c = (uint8_t*)o;
+    for (int off = 0x28; off < 0x4000; off += 8) {
+        uint64_t ptr = 0; int32_t cnt = 0, mx = 0;
+        if (!SafeReadU64(c + off, &ptr) || !IsValidPtr(ptr)) continue;
+        if (!SafeReadI32(c + off + 8, &cnt) || !SafeReadI32(c + off + 12, &mx)) continue;
+        if (cnt < 1 || cnt > 64 || mx < cnt || mx > 256) continue;
+        uint64_t e0 = 0, e1 = 0, e2 = 0;
+        SafeReadU64((uint8_t*)(uintptr_t)ptr, &e0);
+        SafeReadU64((uint8_t*)(uintptr_t)ptr + 8, &e1);
+        SafeReadU64((uint8_t*)(uintptr_t)ptr + 16, &e2);
+        std::wstring ec;
+        if (IsValidObject((UE::UObject*)(uintptr_t)e0)) ec = UEEngine::GetClassName((UE::UObject*)(uintptr_t)e0);
+        Log("[ARRPROBE] %ls +0x%X cnt=%d max=%d  e0=%llX(%ls) e1=%llX e2=%llX\n",
+            tag, off, cnt, mx, (unsigned long long)e0, ec.c_str(),
+            (unsigned long long)e1, (unsigned long long)e2);
+    }
+}
+
+static void ProbeLoadoutArrays(const LocalActors& la) {
+    UEEngine::ForEachObject([&](UE::UObject* o) -> bool {
+        std::wstring cn = UEEngine::GetClassName(o);
+        bool want = cn == L"ValPlayerLoadoutManager" || cn == L"ValInventoryComponent";
+        if (!want) return true;
+        if (UEEngine::GetObjectName(o).find(L"Default__") != std::wstring::npos) return true;
+        if (!OwnerChainReaches(o, la)) return true;
+        ProbeArrays(o, cn.c_str());
+        return true;
+    });
+}
+
 // EQUIPPED-GEAR PROBE: the loadout component tracks EquippedModifiers (gear stat mods → blue)
 // separately from EquippedAugmentIds/EquippedPerkIds (→ yellow). Find the local component that
 // has EquippedModifiers, resolve the array offsets, and dump the array bytes so we can decode
@@ -756,10 +792,9 @@ static void PollStats() {
     {
         static uint64_t s_ip = 0; static int s_ipN = 0;
         uint64_t nowMs = GetTickCount64();
-        if (!g_inLobby && s_ipN < 5 && nowMs - s_ip > 3000 && (la.pawn || la.controller || la.state)) {
+        if (!g_inLobby && s_ipN < 15 && nowMs - s_ip > 3000 && (la.pawn || la.controller || la.state)) {
             s_ip = nowMs; s_ipN++;
-            ProbeEquipped(la);
-            ProbeInventory(la);
+            ProbeLoadoutArrays(la);
         }
     }
 
