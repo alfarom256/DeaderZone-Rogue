@@ -45,8 +45,21 @@ static StatDef g_stats[] = {
     {"Headshot Dmg",     L"HeadshotDamageModifier",          StatDef::Modifier,   -1, 0, false},
     // Augment-condition attributes — NOT drawn as their own rows; folded into the existing
     // Damage / Proc Chance rows via kFolds below (see StatFold).
-    {"_HipfireDmg",      L"HipfireDamageModifier",           StatDef::Modifier,   -1, 0, false},
-    {"_ElementDmg",      L"ElementDamageMultiplier",         StatDef::Multiplier, -1, 0, false},
+    {"_HipfireDmg",      L"HipfireDamageModifier",           StatDef::Multiplier, -1, 0, false},
+    // Elemental damage is PER-ELEMENT (confirmed against the binary + a live property dump);
+    // there is no single "ElementDamageMultiplier" on the attribute set — that name resolved to
+    // nothing, which is why elemental gear looked invisible. All default to 1.0 (neutral), so
+    // folding them into the Damage row multiplicatively is safe: inactive elements contribute 1.0.
+    {"_DmgFire",         L"FireDamageModifier",              StatDef::Multiplier, -1, 0, false},
+    {"_DmgCryo",         L"CryoDamageModifier",              StatDef::Multiplier, -1, 0, false},
+    {"_DmgVoid",         L"VoidDamageModifier",              StatDef::Multiplier, -1, 0, false},
+    {"_DmgElectro",      L"ElectroDamageModifier",           StatDef::Multiplier, -1, 0, false},
+    {"_DmgRadiation",    L"RadiationDamageModifier",         StatDef::Multiplier, -1, 0, false},
+    {"_DmgPsionic",      L"PsionicDamageModifier",           StatDef::Multiplier, -1, 0, false},
+    {"_DmgNano",         L"NanoDamageModifier",              StatDef::Multiplier, -1, 0, false},
+    {"_DmgPlasma",       L"PlasmaDamageModifier",            StatDef::Multiplier, -1, 0, false},
+    {"_DmgKinetic",      L"KineticDamageModifier",           StatDef::Multiplier, -1, 0, false},
+    {"_DmgEnergy",       L"EnergyDamageModifier",            StatDef::Multiplier, -1, 0, false},
     // Hidden proc-chance variants (single '_' = diagnostic, logged on change, not drawn). "Proc
     // Chance" above reads only UniversalProcChanceMultiplier; hipfire/gear procs land on others.
     {"_ProcWeaponStat",  L"WeaponProcChanceMultiplierStat",    StatDef::Multiplier, -1, 0, false},
@@ -62,7 +75,6 @@ static StatDef g_stats[] = {
     {"_ProcPsionic",     L"PsionicProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
     {"_ProcNano",        L"NanoProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
     {"_ProcPlasma",      L"PlasmaProcChanceMultiplier",        StatDef::Multiplier, -1, 0, false},
-    {"_ProcAugment",     L"AugmentProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
     // Hidden ('__') — drives the damage tracker from the game's cumulative counter.
     {"__DamageDealt",    L"DamageDealt",                     StatDef::Absolute,   -1, 0, false},
 };
@@ -78,10 +90,12 @@ static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 // Combine rule follows the target's format: Multiplier rows multiply, Modifier/Chance add.
 struct StatFold { const char* target; const char* source; };
 static const StatFold kFolds[] = {
-    {"Proc Chance", "_ProcAugment"},
     {"Proc Chance", "_ProcElement"},
-    {"Damage",      "_ElementDmg"},
     {"Damage",      "_HipfireDmg"},
+    {"Damage",      "_DmgFire"},   {"Damage", "_DmgCryo"},      {"Damage", "_DmgVoid"},
+    {"Damage",      "_DmgElectro"},{"Damage", "_DmgRadiation"}, {"Damage", "_DmgPsionic"},
+    {"Damage",      "_DmgNano"},   {"Damage", "_DmgPlasma"},    {"Damage", "_DmgKinetic"},
+    {"Damage",      "_DmgEnergy"},
 };
 static constexpr int kNumFolds = sizeof(kFolds) / sizeof(kFolds[0]);
 
