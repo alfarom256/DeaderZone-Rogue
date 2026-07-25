@@ -61,6 +61,7 @@ static StatDef g_stats[] = {
     {"_ProcPsionic",     L"PsionicProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
     {"_ProcNano",        L"NanoProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
     {"_ProcPlasma",      L"PlasmaProcChanceMultiplier",        StatDef::Multiplier, -1, 0, false},
+    {"_ProcAugment",     L"AugmentProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
     // Hidden ('__') — drives the damage tracker from the game's cumulative counter.
     {"__DamageDealt",    L"DamageDealt",                     StatDef::Absolute,   -1, 0, false},
 };
