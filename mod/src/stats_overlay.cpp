@@ -43,14 +43,24 @@ static StatDef g_stats[] = {
     {"Move Speed",       L"MovementSpeed",                   StatDef::Multiplier, -1, 0, false},
     {"Sprint Speed",     L"SprintSpeedMultiplier",           StatDef::Multiplier, -1, 0, false},
     {"Headshot Dmg",     L"HeadshotDamageModifier",          StatDef::Modifier,   -1, 0, false},
-    // Hidden proc-chance variants (single '_' = diagnostic, logged but not drawn). "Proc
-    // Chance" above reads only UniversalProcChanceMultiplier; a +9% proc-gear roll may land on
-    // one of these instead, so we log them all to see which one moves.
+    // Hipfire elemental augment: dedicated attributes for the hipfire damage bonus + element dmg.
+    {"Hipfire Dmg",      L"HipfireDamageModifier",           StatDef::Modifier,   -1, 0, false},
+    {"Element Dmg",      L"ElementDamageMultiplier",         StatDef::Multiplier, -1, 0, false},
+    // Hidden proc-chance variants (single '_' = diagnostic, logged on change, not drawn). "Proc
+    // Chance" above reads only UniversalProcChanceMultiplier; hipfire/gear procs land on others.
     {"_ProcWeaponStat",  L"WeaponProcChanceMultiplierStat",    StatDef::Multiplier, -1, 0, false},
     {"_ProcPrimary",     L"PrimaryWeaponProcChanceMultiplier", StatDef::Multiplier, -1, 0, false},
     {"_ProcSecondary",   L"SecondaryWeaponProcChanceMultiplier",StatDef::Multiplier,-1, 0, false},
     {"_ProcMelee",       L"MeleeProcChanceMultiplier",         StatDef::Multiplier, -1, 0, false},
     {"_ProcElement",     L"ElementProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
+    {"_ProcFire",        L"FireProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
+    {"_ProcCryo",        L"CryoProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
+    {"_ProcVoid",        L"VoidProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
+    {"_ProcLightning",   L"LightningProcChanceMultiplier",     StatDef::Multiplier, -1, 0, false},
+    {"_ProcRadiation",   L"RadiationProcChanceMultiplier",     StatDef::Multiplier, -1, 0, false},
+    {"_ProcPsionic",     L"PsionicProcChanceMultiplier",       StatDef::Multiplier, -1, 0, false},
+    {"_ProcNano",        L"NanoProcChanceMultiplier",          StatDef::Multiplier, -1, 0, false},
+    {"_ProcPlasma",      L"PlasmaProcChanceMultiplier",        StatDef::Multiplier, -1, 0, false},
     // Hidden ('__') — drives the damage tracker from the game's cumulative counter.
     {"__DamageDealt",    L"DamageDealt",                     StatDef::Absolute,   -1, 0, false},
 };
@@ -841,7 +851,15 @@ static void PollStats() {
             SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 8, &base);
             if (SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 12, &val)) {
                 // Flash on change: stamp the time whenever the value actually moves.
-                if (g_statPrevInit[i]) { float d = val - g_statPrev[i]; if (d > 0.0001f || d < -0.0001f) g_statFlashMs[i] = GetTickCount64(); }
+                if (g_statPrevInit[i]) {
+                    float d = val - g_statPrev[i];
+                    if (d > 0.0001f || d < -0.0001f) {
+                        g_statFlashMs[i] = GetTickCount64();
+                        // Instant change-log (catches conditional toggles like hipfire that the
+                        // 5s snapshot misses) — reveals exactly which attribute moves.
+                        Log("[CHG] %-18s %.3f -> %.3f\n", g_stats[i].displayName, g_statPrev[i], val);
+                    }
+                }
                 g_statPrev[i] = val; g_statPrevInit[i] = true;
                 g_stats[i].value = val;
                 g_statBase[i] = base;
