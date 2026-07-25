@@ -43,9 +43,10 @@ static StatDef g_stats[] = {
     {"Move Speed",       L"MovementSpeed",                   StatDef::Multiplier, -1, 0, false},
     {"Sprint Speed",     L"SprintSpeedMultiplier",           StatDef::Multiplier, -1, 0, false},
     {"Headshot Dmg",     L"HeadshotDamageModifier",          StatDef::Modifier,   -1, 0, false},
-    // Hipfire elemental augment: dedicated attributes for the hipfire damage bonus + element dmg.
-    {"Hipfire Dmg",      L"HipfireDamageModifier",           StatDef::Modifier,   -1, 0, false},
-    {"Element Dmg",      L"ElementDamageMultiplier",         StatDef::Multiplier, -1, 0, false},
+    // Augment-condition attributes — NOT drawn as their own rows; folded into the existing
+    // Damage / Proc Chance rows via kFolds below (see StatFold).
+    {"_HipfireDmg",      L"HipfireDamageModifier",           StatDef::Modifier,   -1, 0, false},
+    {"_ElementDmg",      L"ElementDamageMultiplier",         StatDef::Multiplier, -1, 0, false},
     // Hidden proc-chance variants (single '_' = diagnostic, logged on change, not drawn). "Proc
     // Chance" above reads only UniversalProcChanceMultiplier; hipfire/gear procs land on others.
     {"_ProcWeaponStat",  L"WeaponProcChanceMultiplierStat",    StatDef::Multiplier, -1, 0, false},
@@ -67,6 +68,33 @@ static StatDef g_stats[] = {
 };
 static constexpr int kNumStats = sizeof(g_stats) / sizeof(g_stats[0]);
 
+// ── Folded contributions ────────────────────────────────────────────────────
+// The hipfire/aiming augments (elemental, crit, weakpoint) are tag-gated GameplayEffects.
+// The crit and weakpoint ones modify CriticalChanceModifier / WeakpointDamageModifier
+// directly, so those rows already move on their own. The ELEMENTAL one routes through
+// separate attributes (Augment/Element proc chance, Element damage, Hipfire damage), which
+// would otherwise be invisible. Rather than adding new rows, fold each into the row it
+// belongs to: proc contributions -> "Proc Chance", damage contributions -> "Damage".
+// Combine rule follows the target's format: Multiplier rows multiply, Modifier/Chance add.
+struct StatFold { const char* target; const char* source; };
+static const StatFold kFolds[] = {
+    {"Proc Chance", "_ProcAugment"},
+    {"Proc Chance", "_ProcElement"},
+    {"Damage",      "_ElementDmg"},
+    {"Damage",      "_HipfireDmg"},
+};
+static constexpr int kNumFolds = sizeof(kFolds) / sizeof(kFolds[0]);
+
+// Display values WITH folded contributions applied (what the overlay actually draws).
+static float g_statShown[kNumStats]     = {0};
+static float g_statShownBase[kNumStats] = {0};
+
+static int FindStatIdx(const char* name) {
+    for (int i = 0; i < kNumStats; i++)
+        if (strcmp(g_stats[i].displayName, name) == 0) return i;
+    return -1;
+}
+
 // Raw BaseValue (+0x8, FGameplayAttributeData) per stat. NOTE: permanent character upgrades
 // live in CurrentValue, NOT here (confirmed in-game: Max Health base=100, cur=300 with the
 // health perk maxed). So raw Base does NOT include upgrades and is only kept for reference.
@@ -78,7 +106,9 @@ static float g_statBase[kNumStats] = {0};
 static float g_statBaseVal[kNumStats] = {0};
 static bool  g_statBaseSet[kNumStats] = {false};
 
-static float    g_statPrev[kNumStats]     = {0};       // previous value (for change detection)
+static float    g_statRawPrev[kNumStats]  = {0};       // previous RAW attribute value (for [CHG] log)
+static bool     g_statRawPrevInit[kNumStats] = {false};
+static float    g_statPrev[kNumStats]     = {0};       // previous SHOWN value (for flash)
 static bool     g_statPrevInit[kNumStats] = {false};
 static uint64_t g_statFlashMs[kNumStats]  = {0};       // last-change timestamp (subtle flash)
 
@@ -851,17 +881,15 @@ static void PollStats() {
             // value. Their difference is the perk/augment/GE ("yellow") contribution.
             SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 8, &base);
             if (SafeReadFloat((uint8_t*)g_statsComponent + g_stats[i].cachedOffset + 12, &val)) {
-                // Flash on change: stamp the time whenever the value actually moves.
-                if (g_statPrevInit[i]) {
-                    float d = val - g_statPrev[i];
-                    if (d > 0.0001f || d < -0.0001f) {
-                        g_statFlashMs[i] = GetTickCount64();
-                        // Instant change-log (catches conditional toggles like hipfire that the
-                        // 5s snapshot misses) — reveals exactly which attribute moves.
-                        Log("[CHG] %-18s %.3f -> %.3f\n", g_stats[i].displayName, g_statPrev[i], val);
-                    }
+                // Instant change-log (catches conditional toggles like hipfire that the 5s
+                // snapshot misses) — reveals exactly which attribute moves. Flash is stamped
+                // later, off the FOLDED display value, so a folded source flashes its target row.
+                if (g_statRawPrevInit[i]) {
+                    float d = val - g_statRawPrev[i];
+                    if (d > 0.0001f || d < -0.0001f)
+                        Log("[CHG] %-18s %.3f -> %.3f\n", g_stats[i].displayName, g_statRawPrev[i], val);
                 }
-                g_statPrev[i] = val; g_statPrevInit[i] = true;
+                g_statRawPrev[i] = val; g_statRawPrevInit[i] = true;
                 g_stats[i].value = val;
                 g_statBase[i] = base;
                 g_stats[i].found = true;
@@ -876,12 +904,50 @@ static void PollStats() {
     //   RUN:   freeze the base (carried in from the lobby). Only set-once here as a fallback if
     //          we somehow entered a run without a lobby pass. NOT reset on pawn/level changes,
     //          so accumulated pickups (yellow) persist across the run's levels.
+    // Captured for hidden ('_') stats too — folded sources need a baseline so their
+    // contribution to the target row's yellow is measured, not double-counted.
     if (g_stats[0].found && g_stats[0].value > 1.0f) {
         for (int i = 0; i < kNumStats; i++) {
-            if (!g_stats[i].found || g_stats[i].displayName[0] == '_') continue;
+            if (!g_stats[i].found) continue;
+            if (strncmp(g_stats[i].displayName, "__", 2) == 0) continue;   // damage counter
             if (g_inLobby)               { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
             else if (!g_statBaseSet[i])  { g_statBaseVal[i] = g_stats[i].value; g_statBaseSet[i] = true; }
         }
+    }
+
+    // ── Apply folded contributions ──────────────────────────────────────────
+    // Build the values actually drawn: each displayed row = its own attribute combined with
+    // any folded sources (augment/element attrs). Multiplier rows multiply, Modifier/Chance
+    // rows add. The same combination is applied to the baseline so yellow (= shown - base)
+    // reflects only the in-run gain, including gains that arrived via a folded attribute.
+    for (int i = 0; i < kNumStats; i++) {
+        g_statShown[i]     = g_stats[i].value;
+        g_statShownBase[i] = g_statBaseSet[i] ? g_statBaseVal[i] : g_stats[i].value;
+    }
+    for (int f = 0; f < kNumFolds; f++) {
+        int t = FindStatIdx(kFolds[f].target);
+        int s = FindStatIdx(kFolds[f].source);
+        if (t < 0 || s < 0 || !g_stats[t].found || !g_stats[s].found) continue;
+        float sv = g_stats[s].value;
+        float sb = g_statBaseSet[s] ? g_statBaseVal[s] : sv;
+        if (g_stats[t].format == StatDef::Multiplier) {
+            g_statShown[t]     *= sv;
+            g_statShownBase[t] *= sb;
+        } else {
+            g_statShown[t]     += sv;
+            g_statShownBase[t] += sb;
+        }
+    }
+
+    // Flash on change, measured on the FOLDED display value so a row lights up whether the
+    // change came from its own attribute or from one folded into it.
+    for (int i = 0; i < kNumStats; i++) {
+        if (!g_stats[i].found) continue;
+        if (g_statPrevInit[i]) {
+            float d = g_statShown[i] - g_statPrev[i];
+            if (d > 0.0001f || d < -0.0001f) g_statFlashMs[i] = GetTickCount64();
+        }
+        g_statPrev[i] = g_statShown[i]; g_statPrevInit[i] = true;
     }
 
     // Re-arm the diagnostic LIVE every 5s during a run (capped) so it captures settled
@@ -1005,10 +1071,12 @@ void Render() {
         if (g_stats[i].displayName[0] == '_') continue;   // hidden (e.g. __DamageDealt)
         anyFound = true;
 
-        float val    = g_stats[i].value;
-        // yellow = in-run gear/item pickups = CurrentValue - effective base, where the
-        // effective base (raw + character upgrades) was captured in the lobby. 0 until captured.
-        float yellow = g_statBaseSet[i] ? (val - g_statBaseVal[i]) : 0.0f;
+        // Folded display value: this row's attribute combined with any augment/element
+        // attributes folded into it (see kFolds), so conditional augments show up here
+        // instead of as separate rows.
+        float val    = g_statShown[i];
+        // yellow = in-run gear/item pickups = shown - effective base (both folded the same way).
+        float yellow = g_statBaseSet[i] ? (val - g_statShownBase[i]) : 0.0f;
 
         ImGui::TextUnformatted(g_stats[i].displayName);
         ImGui::SameLine(windowWidth * 0.52f);
