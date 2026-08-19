@@ -21,3 +21,8 @@ mod/download_icons.ps1
 Thumbs.db
 .DS_Store
 .vs/
+
+# Local working artifacts (not part of the published mod)
+*.zip
+modpage.bbcode.txt
+network_audit.md

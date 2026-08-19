@@ -328,8 +328,14 @@ static uint64_t ResolveDamageKey() {
     uintptr_t base = UEEngine::GetModuleBase();
     if (!base) return 0;
     void* reg = nullptr;
+    // The SEH net is a last resort, NOT a licence to call this early. A fault here means the
+    // engine singleton this touches was already poisoned (see PollRunDamage), so say so
+    // loudly - swallowing it silently is what let issue #1 go unnoticed until it crashed.
     __try { reg = ((void* (*)())(base + 0x5D60000))(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[DMGSTAT] FATAL: damage-key resolver faulted - called before GameplayAbilities was ready\n");
+        return 0;
+    }
     if (!reg || !IsValidPtr((uint64_t)(uintptr_t)reg)) return 0;
     uint64_t key = 0;
     SafeReadU64((uint8_t*)reg + 0xDC0, &key);
@@ -378,7 +384,23 @@ static bool ReadRunDamageTotal(double* out) {
 // BINDING ONLY (called at the 250ms cadence). The actual damage READ happens faster in
 // Poll() for responsive burst DPS. Run-boundary reset is handled by PollStats (GameState).
 static void PollRunDamage(const LocalActors& la) {
-    if (!g_dmgKey) g_dmgKey = ResolveDamageKey();
+    // ORDERING IS LOAD-BEARING (issue #1 - crash at startup).
+    // ResolveDamageKey() calls a native engine function whose very first act is the
+    // IGameplayAbilitiesModule accessor, an MSVC thread-safe static. Call it before the
+    // GameplayAbilities module is loaded and it permanently caches a NULL module pointer
+    // and marks itself initialised; the game thread then takes the fast path, dereferences
+    // that NULL and dies with EXCEPTION_ACCESS_VIOLATION reading 0x0 during
+    // "Initializing Engine...". Our mod thread polls from process start, so without this
+    // gate we race module loading - and lose on faster machines.
+    //
+    // A local player plus a bound attribute set together prove GAS is up, so only resolve
+    // the key once both exist. We only need damage numbers in a match anyway.
+    if (!g_dmgKey) {
+        if (!la.pawn && !la.controller && !la.state) return;   // no world/local player yet
+        if (!g_statsComponent) return;                         // GAS not proven live yet
+        g_dmgKey = ResolveDamageKey();
+        if (g_dmgKey) Log("[DMGSTAT] damage key resolved (GAS live)\n");
+    }
     if (!g_dmgKey) return;
     if (!g_dmgStatsComp || !IsValidObject(g_dmgStatsComp)) {
         if (la.pawn || la.controller || la.state) {
